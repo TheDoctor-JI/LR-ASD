@@ -323,11 +323,10 @@ def main():
         subprocess.run([
             "ffmpeg", "-y",
             "-i", args.video_path,
-            "-r", str(args.target_fps),
-            "-vsync", "cfr",
-            "-c:v", "mpeg4",
             "-qscale:v", "2",
-            "-pix_fmt", "yuv420p",
+            "-threads", "4",
+            "-async", "1",
+            "-r", str(args.target_fps),
             video_copy_path,
             "-loglevel", "panic",
         ], check=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)

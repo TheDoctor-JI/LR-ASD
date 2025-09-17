@@ -187,7 +187,7 @@ def stream_prepared_timeline(out_dir: str, model_path: str = "weight/pretrain_AV
             # Visualize the results on the frame
             # Color: green if speaking, red if not
             color = (0, 255, 0) if decision else (0, 0, 255)
-            cv2.rectangle(vis, (x1, y1), (x2, y2), color, 3)
+            cv2.rectangle(vis, (x1, y1), (x2, y2), color, 5)
             txt = f"{tid} ({score:.2f}) Speaking={int(decision)}" if score is not None else f"{tid} warming up"
             cv2.putText(vis, txt, (x1, max(0, y1 - 8)), cv2.FONT_HERSHEY_SIMPLEX, 2, color, 2, cv2.LINE_AA)
 
@@ -260,7 +260,7 @@ def stream_prepared_timeline(out_dir: str, model_path: str = "weight/pretrain_AV
 
 if __name__ == "__main__":
     # Example: use prepared data under demo/0002_prepared (run tests/test_prepare_data.py first)
-    prep_dir = os.path.join("demo", "0001_prepared")
+    prep_dir = os.path.join("demo", "0002_prepared")
     if os.path.exists(os.path.join(prep_dir, "tracks.json")):
         stream_prepared_timeline(prep_dir)
     else:
