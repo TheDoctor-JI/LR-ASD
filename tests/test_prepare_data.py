@@ -5,6 +5,7 @@ import math
 import argparse
 import shutil
 import subprocess
+import glob
 from dataclasses import dataclass, asdict
 from typing import List, Dict, Tuple, Optional
 
@@ -93,22 +94,23 @@ def save_frame(frame: np.ndarray, path: str) -> None:
     cv2.imwrite(path, frame)
 
 
-def run_detection_and_tracking(
-    video_path: str,
-    out_frames_dir: str,
+def run_detection_and_tracking_from_frames(
+    frames_dir: str,
     device: str = 'cuda',
-    conf_th: float = 0.8,
+    conf_th: float = 0.9,
     iou_thres: float = 0.5,
     min_track: int = 10,
     num_failed_det: int = 10,
-    forced_fps: Optional[float] = None,
+    facedet_scale: float = 0.25,
+    forced_fps: float = 25.0,
 ) -> Tuple[List[Track], Dict]:
-    cap = cv2.VideoCapture(video_path)
-    if not cap.isOpened():
-        raise RuntimeError(f"Failed to open video: {video_path}")
-    fps = forced_fps if (forced_fps is not None) else (cap.get(cv2.CAP_PROP_FPS) or 25.0)
-    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    flist = sorted(glob.glob(os.path.join(frames_dir, '*.jpg')))
+    if len(flist) == 0:
+        raise RuntimeError(f"No frames found in {frames_dir}")
+    first = cv2.imread(flist[0])
+    if first is None:
+        raise RuntimeError(f"Failed to read first frame: {flist[0]}")
+    height, width = first.shape[:2]
 
     detector = S3FD(device=device)
 
@@ -116,16 +118,14 @@ def run_detection_and_tracking(
     finished: List[Track] = []
     next_id = 0
 
-    frame_idx = 0
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
-        # Save original frame
-        save_frame(frame, os.path.join(out_frames_dir, f"{frame_idx:06d}.jpg"))
+    for frame_idx, fpath in enumerate(flist):
+        img_bgr = cv2.imread(fpath)
+        if img_bgr is None:
+            continue
+        img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
 
-        # Detect faces
-        bboxes = detector.detect_faces(frame, conf_th=conf_th)
+        # Detect faces (match Columbia_test defaults)
+        bboxes = detector.detect_faces(img_rgb, conf_th=conf_th, scales=[facedet_scale])
         dets = []
         for b in bboxes:
             x1, y1, x2, y2, sc = b.tolist()
@@ -134,11 +134,9 @@ def run_detection_and_tracking(
 
         # Assign to tracks via greedy IOU
         used = set()
-        # Precompute track last boxes
         track_ids = list(active.keys())
         last_boxes = {tid: np.array(active[tid]["bbox"], dtype=np.float32) for tid in track_ids}
-        # For each detection, find best track
-        assignments: List[Tuple[str, int]] = []  # (track_id, det_index)
+        assignments: List[Tuple[str, int]] = []
         for di, (bb, sc) in enumerate(dets):
             best_tid = None
             best_iou = iou_thres
@@ -153,14 +151,12 @@ def run_detection_and_tracking(
                 assignments.append((best_tid, di))
                 used.add(best_tid)
 
-        # Update matched tracks
         for tid, di in assignments:
             bb, sc = dets[di]
             active[tid]["bbox"] = bb.tolist()
             active[tid]["miss"] = 0
             active[tid]["track"].bboxes.append((frame_idx, bb.tolist(), sc))
 
-        # Create new tracks for unmatched detections
         unmatched = [di for di in range(len(dets)) if all(di != adi for _, adi in assignments)]
         for di in unmatched:
             bb, sc = dets[di]
@@ -169,7 +165,6 @@ def run_detection_and_tracking(
             tr = Track(id=tid, start_frame=frame_idx, end_frame=None, bboxes=[(frame_idx, bb.tolist(), sc)])
             active[tid] = {"bbox": bb.tolist(), "miss": 0, "track": tr}
 
-        # Age unmatched tracks; finish if too many misses
         to_remove = []
         for tid, st in active.items():
             if tid in used:
@@ -178,27 +173,21 @@ def run_detection_and_tracking(
             if st["miss"] > num_failed_det:
                 tr: Track = st["track"]
                 tr.end_frame = tr.bboxes[-1][0]
-                # Filter by min length
                 if (tr.end_frame - tr.start_frame + 1) >= min_track:
                     finished.append(tr)
                 to_remove.append(tid)
         for tid in to_remove:
             active.pop(tid, None)
 
-        frame_idx += 1
-
-    # End of video: close remaining tracks
     for tid, st in active.items():
         tr: Track = st["track"]
         tr.end_frame = tr.bboxes[-1][0]
         if (tr.end_frame - tr.start_frame + 1) >= min_track:
             finished.append(tr)
 
-    cap.release()
-
     meta = {
-        "fps": float(fps),
-        "num_frames": int(frame_idx),
+        "fps": float(forced_fps),
+        "num_frames": int(len(flist)),
         "width": int(width),
         "height": int(height),
     }
@@ -212,6 +201,7 @@ def write_track_media(
     fps: float,
     audio_wav: str,
     sample_rate: int = 16000,
+    threads: int = 4,
 ):
     ensure_dir(out_tracks_dir)
 
@@ -231,9 +221,11 @@ def write_track_media(
             }, f, indent=2)
 
         # Crop face video for convenience (224x224)
+        # Follow Columbia: write a temporary video, then mux with audio into final face.avi
         face_avi = os.path.join(tr_dir, "face.avi")
+        face_avi_tmp = os.path.join(tr_dir, "face_t.avi")
         fourcc = cv2.VideoWriter_fourcc(*"XVID")
-        writer = cv2.VideoWriter(face_avi, fourcc, fps, (224, 224))
+        writer = cv2.VideoWriter(face_avi_tmp, fourcc, fps, (224, 224))
         bbox_by_frame = {f: (bb, sc) for (f, bb, sc) in tr.bboxes}
         last_bb = None
         for fi in range(tr.start_frame, tr.end_frame + 1):
@@ -260,11 +252,16 @@ def write_track_media(
         face_wav = os.path.join(tr_dir, "face.wav")
         ss = tr.start_frame / fps
         to = (tr.end_frame + 1) / fps
+        # Match Columbia_test crop audio flags exactly
         cmd = [
             "ffmpeg", "-y",
             "-i", audio_wav,
+            "-async", "1",
+            "-ac", "1",
+            "-vn",
             "-acodec", "pcm_s16le",
             "-ar", str(sample_rate),
+            "-threads", str(threads),
             "-ss", f"{ss:.3f}",
             "-to", f"{to:.3f}",
             face_wav,
@@ -275,6 +272,31 @@ def write_track_media(
         except Exception:
             # Best-effort; continue even if audio clip fails
             pass
+
+        # Mux temp video with audio into final face.avi (match Columbia flags)
+        try:
+            subprocess.run([
+                "ffmpeg", "-y",
+                "-i", face_avi_tmp,
+                "-i", face_wav,
+                "-threads", str(threads),
+                "-c:v", "copy",
+                "-c:a", "copy",
+                face_avi,
+                "-loglevel", "panic",
+            ], check=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+            # remove temp if mux succeeded
+            try:
+                os.remove(face_avi_tmp)
+            except Exception:
+                pass
+        except Exception:
+            # Fallback: ensure face.avi exists even without audio
+            try:
+                if os.path.exists(face_avi_tmp):
+                    os.replace(face_avi_tmp, face_avi)
+            except Exception:
+                pass
 
         # Update track paths
         tr.paths = {
@@ -289,13 +311,14 @@ def main():
     parser.add_argument("--video_path", type=str, required=True, help="Input video file")
     parser.add_argument("--out_dir", type=str, required=True, help="Output directory for prepared data")
     parser.add_argument("--device", type=str, default="auto", help="Device for S3FD: auto|cuda|cpu")
-    parser.add_argument("--conf_th", type=float, default=0.8, help="Face detection confidence threshold")
+    parser.add_argument("--conf_th", type=float, default=0.9, help="Face detection confidence threshold (match Columbia)")
     parser.add_argument("--iou_thres", type=float, default=0.5, help="IOU threshold for tracking association")
     parser.add_argument("--min_track", type=int, default=10, help="Minimum frames to keep a track")
     parser.add_argument("--num_failed_det", type=int, default=10, help="Max missed frames before ending a track")
-    parser.add_argument("--threads", type=int, default=4, help="Threads for ffmpeg operations")
+    parser.add_argument("--threads", type=int, default=10, help="Threads for ffmpeg operations (match Columbia)")
     parser.add_argument("--sample_rate", type=int, default=16000, help="Audio sample rate")
-    parser.add_argument("--target_fps", type=float, default=25.0, help="Target FPS for CFR AVI conversion")
+    parser.add_argument("--target_fps", type=float, default=25.0, help="Target FPS for CFR AVI conversion (match Columbia)")
+    parser.add_argument("--facedet_scale", type=float, default=0.25, help="Face detector scale (match Columbia)")
 
     args = parser.parse_args()
 
@@ -315,18 +338,17 @@ def main():
     else:
         resolved_device = args.device
 
-    # 0) Convert input video to constant-FPS AVI for consistent timeline (like Columbia_test)
+    # 0) Convert input video to constant-FPS AVI (EXACT flags as Columbia_test)
     video_copy_path = os.path.join(out_media, "video.avi")
     ensure_dir(out_media)
     try:
-        # Re-encode to CFR AVI with MPEG-4 video for robust OpenCV decoding
         subprocess.run([
             "ffmpeg", "-y",
             "-i", args.video_path,
             "-qscale:v", "2",
-            "-threads", "4",
+            "-threads", str(args.threads),
             "-async", "1",
-            "-r", str(args.target_fps),
+            "-r", str(int(args.target_fps)),
             video_copy_path,
             "-loglevel", "panic",
         ], check=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
@@ -342,19 +364,33 @@ def main():
     # Extract from the CFR AVI to ensure alignment with frames
     extract_audio(video_copy_path, audio_wav, sr=args.sample_rate, threads=args.threads)
 
-    # 2) Detect & track across entire video while saving frames
-    tracks, video_meta = run_detection_and_tracking(
-        video_copy_path,
+    # 2) Extract frames using ffmpeg (EXACT flags as Columbia_test)
+    try:
+        subprocess.run([
+            "ffmpeg", "-y",
+            "-i", video_copy_path,
+            "-qscale:v", "2",
+            "-threads", str(args.threads),
+            "-f", "image2",
+            os.path.join(out_frames, "%06d.jpg"),
+            "-loglevel", "panic",
+        ], check=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    except Exception as e:
+        raise RuntimeError(f"ffmpeg failed to extract frames: {e}")
+
+    # 3) Detect & track across frames
+    tracks, video_meta = run_detection_and_tracking_from_frames(
         out_frames,
         device=resolved_device,
         conf_th=args.conf_th,
         iou_thres=args.iou_thres,
         min_track=args.min_track,
         num_failed_det=args.num_failed_det,
+        facedet_scale=float(args.facedet_scale),
         forced_fps=float(args.target_fps),
     )
 
-    # 3) Write per-track convenience media (face crops + audio slices)
+    # 4) Write per-track convenience media (face crops + audio slices)
     write_track_media(
         tracks,
         frames_dir=out_frames,
@@ -362,9 +398,10 @@ def main():
         fps=video_meta["fps"],
         audio_wav=audio_wav,
         sample_rate=args.sample_rate,
+        threads=args.threads,
     )
 
-    # 4) Save tracks.json (time-stamped)
+    # 5) Save tracks.json (time-stamped)
     tracks_json = {
         "video": {
             "path": video_copy_path,

@@ -57,7 +57,7 @@ def stream_prepared_timeline(out_dir: str, model_path: str = "weight/pretrain_AV
         model_path=model_path,
         window_seconds=10.0,
         video_fps=fps,
-        score_threshold=0,
+        score_threshold=-0.75,
     )
 
     # Build per-frame bbox lists for quick access
@@ -110,7 +110,7 @@ def stream_prepared_timeline(out_dir: str, model_path: str = "weight/pretrain_AV
                         "series": series,
                     }
                 last_trigger_time = now
-            time.sleep(0.005)
+            time.sleep(0.0025)
 
     proc_thread = threading.Thread(target=processor_loop)
     proc_thread.start()
