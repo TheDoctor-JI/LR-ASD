@@ -20,17 +20,12 @@ except Exception:
     sa = None
 
 
-def stream_demo_sequence(video_folder: str, model_path: str = "weight/pretrain_AVA.model"):
+def stream_demo_sequence(video_folder: str, model_path: str = "weight/pretrain_AVA.model", trigger_interval_s: float = 0.2):
     """
     Emulate realtime streaming using demo preprocessed clips in demo/0001.
 
-    This test script performs the preprocessing steps (face tracking/cropping) OUTSIDE
-    of the ASD class by reusing the already-cropped face clip produced by Columbia_test.
-
-    Expected input files (produced by running the demo):
-      demo/0001/pycrop/00000.avi
-      demo/0001/pycrop/00000.wav
-    Or multiple face tracks like 00000.avi, 00001.avi, etc.
+    The ASD class is externally driven: stream data at realtime cadence and trigger infer()
+    every trigger_interval_s. Visualization shows the average score during last trigger window.
     """
     pycrop = os.path.join(video_folder, "pycrop")
     avi_files = sorted(glob.glob(os.path.join(pycrop, "*.avi")))
@@ -43,6 +38,9 @@ def stream_demo_sequence(video_folder: str, model_path: str = "weight/pretrain_A
         video_fps=25.0,
         score_threshold=-1.5,
     )
+
+    track_id = "t0"
+    asd.add_track(track_id)
 
     cv2.namedWindow("LR-ASD Realtime", cv2.WINDOW_NORMAL)
 
@@ -57,7 +55,6 @@ def stream_demo_sequence(video_folder: str, model_path: str = "weight/pretrain_A
         sr, audio = wavfile.read(wav_path)
         if audio.ndim > 1:
             audio = audio[:, 0]
-        # Normalize to float32 [-1,1]
         if audio.dtype != np.float32:
             audio = audio.astype(np.float32)
             if np.max(np.abs(audio)) > 1.0:
@@ -77,50 +74,77 @@ def stream_demo_sequence(video_folder: str, model_path: str = "weight/pretrain_A
         except Exception as e:
             print(f"Audio playback initialization failed: {e}")
 
-        # Open video for frame-by-frame feed
         cap = cv2.VideoCapture(avi_path)
         if not cap.isOpened():
             print(f"Failed to open {avi_path}")
-            # Stop audio if started
             if sd is not None:
                 sd.stop()
             elif play_obj is not None:
                 play_obj.stop()
             continue
 
-        # Emulate realtime: feed per frame and a matching audio chunk to ASD
-        frame_period = 1.0 / 25.0
+        # Realtime streaming settings
+        video_fps = 25.0
+        frame_period = 1.0 / video_fps
         audio_chunk = int(round(frame_period * sr))
+        last_trigger_time = time.time()
+        recent_scores: list[float] = []
+
         frame_idx = 0
         while True:
+            start_loop = time.time()
             ret, frame = cap.read()
             if not ret:
                 break
 
-            # Push one frame
-            asd.push_video_frame(frame)
+            # Push one frame at realtime cadence
+            asd.push_video_frame(track_id, frame)
 
             # Push matching audio slice into ASD
-            start = frame_idx * audio_chunk
-            end = min(len(audio), (frame_idx + 1) * audio_chunk)
-            if start < end:
-                asd.push_audio_samples(audio[start:end], sr=sr)
+            a_start = frame_idx * audio_chunk
+            a_end = min(len(audio), (frame_idx + 1) * audio_chunk)
+            if a_start < a_end:
+                asd.push_audio_samples(audio[a_start:a_end], sr=sr)
 
-            # External app drives inference each frame
-            score, decision = asd.step()
+            # Trigger batched inference every trigger_interval_s
+            now = time.time()
+            if now - last_trigger_time >= trigger_interval_s:
+                res = asd.infer(min_required_seconds=0.5)
+                if track_id in res:
+                    # Average score over last trigger window duration
+                    series = res[track_id]['series']
+                    # Take last N frames ~ trigger_interval_s
+                    N = max(1, int(round(trigger_interval_s * video_fps)))
+                    avg_score = float(np.mean(series[-N:]))
+                    recent_scores.append(avg_score)
+                    last_score = avg_score
+                    decision = bool(last_score >= asd.score_threshold)
+                else:
+                    last_score = None
+                    decision = False
+                last_trigger_time = now
+            else:
+                # Keep showing the last result
+                if recent_scores:
+                    last_score = recent_scores[-1]
+                    decision = bool(last_score >= asd.score_threshold)
+                else:
+                    last_score = None
+                    decision = False
 
             # Visualization overlay
             vis = frame.copy()
-            txt = f"score={score:.2f} active={int(decision)}" if score is not None else "warming up..."
-            color = (0, 255, 0) if (score is not None and decision) else (0, 0, 255)
+            txt = f"avg@{trigger_interval_s:.1f}s={last_score:.2f} active={int(decision)}" if last_score is not None else "warming up..."
+            color = (0, 255, 0) if (last_score is not None and decision) else (0, 0, 255)
             cv2.putText(vis, txt, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1.0, color, 2, cv2.LINE_AA)
-            # Draw border to indicate decision
             h, w = vis.shape[:2]
             cv2.rectangle(vis, (2, 2), (w - 3, h - 3), color, 3)
 
+            # Display and sleep to maintain realtime cadence
             cv2.imshow("LR-ASD Realtime", vis)
-            # Keep visualization responsive; audio playback paces overall flow
-            key = cv2.waitKey(max(1, int(frame_period * 1000 / 2)))
+            elapsed = time.time() - start_loop
+            delay_ms = max(1, int((frame_period - elapsed) * 1000)) if elapsed < frame_period else 1
+            key = cv2.waitKey(delay_ms)
             if key & 0xFF == ord('q'):
                 break
 
@@ -140,5 +164,4 @@ def stream_demo_sequence(video_folder: str, model_path: str = "weight/pretrain_A
 
 
 if __name__ == "__main__":
-    # Default to demo path created by the repository's demo
     stream_demo_sequence(os.path.join("demo", "0001"))
