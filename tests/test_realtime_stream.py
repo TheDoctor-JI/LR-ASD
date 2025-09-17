@@ -4,7 +4,8 @@ import glob
 import numpy as np
 import cv2
 from scipy.io import wavfile
-import os, sys
+import sys
+import threading
 sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
 
 from realtime_asd import ASDRealtime
@@ -24,8 +25,9 @@ def stream_demo_sequence(video_folder: str, model_path: str = "weight/pretrain_A
     """
     Emulate realtime streaming using demo preprocessed clips in demo/0001.
 
-    The ASD class is externally driven: stream data at realtime cadence and trigger infer()
-    every trigger_interval_s. Visualization shows the average score during last trigger window.
+    The ASD class is externally driven: stream data at realtime cadence in the main thread and
+    trigger infer() on a separate processing thread every trigger_interval_s.
+    Visualization shows the average score during last trigger window.
     """
     pycrop = os.path.join(video_folder, "pycrop")
     avi_files = sorted(glob.glob(os.path.join(pycrop, "*.avi")))
@@ -87,12 +89,34 @@ def stream_demo_sequence(video_folder: str, model_path: str = "weight/pretrain_A
         video_fps = 25.0
         frame_period = 1.0 / video_fps
         audio_chunk = int(round(frame_period * sr))
-        last_trigger_time = time.time()
-        recent_scores: list[float] = []
+
+        # Shared result between threads
+        result = {"score": None, "decision": False}
+        result_lock = threading.Lock()
+        stop_evt = threading.Event()
+
+        def processor_loop():
+            last_trigger_time = time.time()
+            while not stop_evt.is_set():
+                now = time.time()
+                if now - last_trigger_time >= trigger_interval_s:
+                    res = asd.infer(min_required_seconds=0.5)
+                    if track_id in res:
+                        series = res[track_id]['series']
+                        N = max(1, int(round(trigger_interval_s * video_fps)))
+                        avg_score = float(np.mean(series[-N:]))
+                        with result_lock:
+                            result["score"] = avg_score
+                            result["decision"] = bool(avg_score >= asd.score_threshold)
+                    last_trigger_time = now
+                time.sleep(0.005)  # avoid busy-wait
+
+        proc_thread = threading.Thread(target=processor_loop, daemon=True)
+        proc_thread.start()
 
         frame_idx = 0
         while True:
-            start_loop = time.time()
+            loop_start = time.time()
             ret, frame = cap.read()
             if not ret:
                 break
@@ -106,35 +130,16 @@ def stream_demo_sequence(video_folder: str, model_path: str = "weight/pretrain_A
             if a_start < a_end:
                 asd.push_audio_samples(audio[a_start:a_end], sr=sr)
 
-            # Trigger batched inference every trigger_interval_s
-            now = time.time()
-            if now - last_trigger_time >= trigger_interval_s:
-                res = asd.infer(min_required_seconds=0.5)
-                if track_id in res:
-                    # Average score over last trigger window duration
-                    series = res[track_id]['series']
-                    # Take last N frames ~ trigger_interval_s
-                    N = max(1, int(round(trigger_interval_s * video_fps)))
-                    avg_score = float(np.mean(series[-N:]))
-                    recent_scores.append(avg_score)
-                    last_score = avg_score
-                    decision = bool(last_score >= asd.score_threshold)
-                else:
-                    last_score = None
-                    decision = False
-                last_trigger_time = now
-            else:
-                # Keep showing the last result
-                if recent_scores:
-                    last_score = recent_scores[-1]
-                    decision = bool(last_score >= asd.score_threshold)
-                else:
-                    last_score = None
-                    decision = False
+            # Visualization overlay (latest result from processor thread)
+            with result_lock:
+                last_score = result["score"]
+                decision = result["decision"]
 
-            # Visualization overlay
             vis = frame.copy()
-            txt = f"avg@{trigger_interval_s:.1f}s={last_score:.2f} active={int(decision)}" if last_score is not None else "warming up..."
+            txt = (
+                f"avg@{trigger_interval_s:.1f}s={last_score:.2f} active={int(decision)}"
+                if last_score is not None else "warming up..."
+            )
             color = (0, 255, 0) if (last_score is not None and decision) else (0, 0, 255)
             cv2.putText(vis, txt, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1.0, color, 2, cv2.LINE_AA)
             h, w = vis.shape[:2]
@@ -142,7 +147,7 @@ def stream_demo_sequence(video_folder: str, model_path: str = "weight/pretrain_A
 
             # Display and sleep to maintain realtime cadence
             cv2.imshow("LR-ASD Realtime", vis)
-            elapsed = time.time() - start_loop
+            elapsed = time.time() - loop_start
             delay_ms = max(1, int((frame_period - elapsed) * 1000)) if elapsed < frame_period else 1
             key = cv2.waitKey(delay_ms)
             if key & 0xFF == ord('q'):
@@ -150,8 +155,10 @@ def stream_demo_sequence(video_folder: str, model_path: str = "weight/pretrain_A
 
             frame_idx += 1
 
+        # Cleanup this clip
+        stop_evt.set()
+        proc_thread.join(timeout=1.0)
         cap.release()
-        # Stop audio playback for this clip
         try:
             if sd is not None:
                 sd.stop()
