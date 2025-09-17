@@ -3,6 +3,7 @@ import numpy as np
 import torch
 from collections import deque
 from typing import Optional, Dict, List
+import threading
 
 import cv2
 from scipy.signal import resample_poly
@@ -67,39 +68,49 @@ class ASDRealtime:
         self._tracks: Dict[str, deque[np.ndarray]] = {}
 
         # Shared audio buffer (list of chunks)
-        self._audio_buffers: deque[np.ndarray] = deque()
+        self._audio_buffer: deque[np.ndarray] = deque()
         self._audio_len: int = 0
 
         # Last outputs (per-track)
         self.last_score: Dict[str, Optional[float]] = {}
         self.last_decision: Dict[str, Optional[bool]] = {}
 
+        # Locks for thread-safe access with minimal contention
+        self._tracks_lock = threading.Lock()
+
+
     # ------------------------- Track Management -------------------------
 
     def add_track(self, track_id: str) -> None:
-        if track_id not in self._tracks:
-            self._tracks[track_id] = deque(maxlen=self._window_video_frames)
-            self.last_score[track_id] = None
-            self.last_decision[track_id] = None
+        with self._tracks_lock:
+            if track_id not in self._tracks:
+                self._tracks[track_id] = deque(maxlen=self._window_video_frames)
+                self.last_score[track_id] = None
+                self.last_decision[track_id] = None
 
     def remove_track(self, track_id: str) -> None:
-        if track_id in self._tracks:
-            del self._tracks[track_id]
-        self.last_score.pop(track_id, None)
-        self.last_decision.pop(track_id, None)
+        with self._tracks_lock:
+            if track_id in self._tracks:
+                del self._tracks[track_id]
+            self.last_score.pop(track_id, None)
+            self.last_decision.pop(track_id, None)
 
     def list_tracks(self) -> List[str]:
-        return list(self._tracks.keys())
+        with self._tracks_lock:
+            return list(self._tracks.keys())
 
     # ------------------------- Streaming Inputs -------------------------
 
     def push_video_frame(self, track_id: str, frame: np.ndarray) -> None:
         """Push a single face-cropped frame for a specific track."""
-        if track_id not in self._tracks:
-            # Auto-create track if not present
-            self.add_track(track_id)
         proc = self._preprocess_frame(frame)
-        self._tracks[track_id].append(proc)
+        with self._tracks_lock:
+            if track_id not in self._tracks:
+                # Auto-create track if not present
+                self._tracks[track_id] = deque(maxlen=self._window_video_frames)
+                self.last_score[track_id] = None
+                self.last_decision[track_id] = None
+            self._tracks[track_id].append(proc)
 
     def push_audio_samples(self, samples: np.ndarray, sr: Optional[int] = None) -> None:
         """Push raw PCM audio samples shared by all tracks."""
@@ -112,16 +123,16 @@ class ASDRealtime:
             down = int(sr)
             samples = resample_poly(samples, up, down).astype(np.float32)
         # Clip to window size by dropping old chunks
-        self._audio_buffers.append(samples)
+        self._audio_buffer.append(samples)
         self._audio_len += len(samples)
-        while self._audio_len > self._window_audio_samples and len(self._audio_buffers) > 0:
+        while self._audio_len > self._window_audio_samples and len(self._audio_buffer) > 0:
             drop = self._audio_len - self._window_audio_samples
-            head = self._audio_buffers[0]
+            head = self._audio_buffer[0]
             if len(head) <= drop:
-                self._audio_buffers.popleft()
+                self._audio_buffer.popleft()
                 self._audio_len -= len(head)
             else:
-                self._audio_buffers[0] = head[drop:]
+                self._audio_buffer[0] = head[drop:]
                 self._audio_len -= drop
                 break
 
@@ -138,10 +149,13 @@ class ASDRealtime:
           - 'decision': bool, last >= score_threshold
         Tracks without enough context are omitted from the result.
         """
-        ready_tracks = [
-            tid for tid, buf in self._tracks.items()
-            if len(buf) >= int(max(2, round(min_required_seconds * self.video_fps)))
-        ]
+        # Snapshot ready tracks and their buffers under lock
+        with self._tracks_lock:
+            ready_tracks = [
+                tid for tid, buf in self._tracks.items()
+                if len(buf) >= int(max(2, round(min_required_seconds * self.video_fps)))
+            ]
+            tracks_snapshot = {tid: list(self._tracks[tid]) for tid in ready_tracks}
         if len(ready_tracks) == 0:
             return {}
 
@@ -162,7 +176,7 @@ class ASDRealtime:
         # Determine common length_sec across tracks and audio (as in demo)
         lengths_sec = []
         for tid in ready_tracks:
-            vlen = len(self._tracks[tid])
+            vlen = len(tracks_snapshot[tid])
             lengths_sec.append(vlen / self.video_fps)
         audio_sec = (mfcc.shape[0] - (mfcc.shape[0] % 4)) / 100.0
         length_sec = min(min(lengths_sec), audio_sec, self.window_seconds)
@@ -179,7 +193,8 @@ class ASDRealtime:
         mfcc = mfcc[-a_len:, :]
         video_batch: List[np.ndarray] = []
         for tid in ready_tracks:
-            vbuf = np.stack(list(self._tracks[tid]), axis=0)
+            vbuf_list = tracks_snapshot[tid]
+            vbuf = np.stack(vbuf_list, axis=0)
             video_batch.append(vbuf[-v_len:, :, :])
         video_batch_np = np.stack(video_batch, axis=0)  # (B, T, 112, 112)
 
@@ -228,11 +243,13 @@ class ASDRealtime:
         self.score_threshold = float(thr)
 
     def reset(self) -> None:
-        self._tracks.clear()
-        self._audio_buffers.clear()
+        with self._tracks_lock:
+            self._tracks.clear()
+            self.last_score.clear()
+            self.last_decision.clear()
+
+        self._audio_buffer.clear()
         self._audio_len = 0
-        self.last_score.clear()
-        self.last_decision.clear()
 
     # ------------------------- Internals -------------------------
 
@@ -252,9 +269,10 @@ class ASDRealtime:
         return cropped.astype(np.uint8)
 
     def _concat_audio(self) -> np.ndarray:
-        if len(self._audio_buffers) == 0:
+        if len(self._audio_buffer) == 0:
             return np.zeros(0, dtype=np.float32)
-        arr = np.concatenate(list(self._audio_buffers), axis=0)
+        bufs = list(self._audio_buffer)
+        arr = np.concatenate(bufs, axis=0)
         if len(arr) > self._window_audio_samples:
             arr = arr[-self._window_audio_samples :]
         return arr

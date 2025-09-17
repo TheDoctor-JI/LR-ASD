@@ -1,6 +1,7 @@
 import os
 import time
 import glob
+import json
 import numpy as np
 import cv2
 from scipy.io import wavfile
@@ -8,6 +9,7 @@ import sys
 import threading
 import shutil
 import subprocess
+from typing import Dict, List
 sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
 
 from realtime_asd import ASDRealtime
@@ -26,261 +28,240 @@ except Exception:
 
 VISUALIZE_LOCALLY = False
 
-def stream_demo_sequence(video_folder: str, model_path: str = "weight/pretrain_AVA.model", trigger_interval_s: float = 0.05):
+def stream_prepared_timeline(out_dir: str, model_path: str = "weight/pretrain_AVA.model", trigger_interval_s: float = 0.1):
     """
-    Emulate realtime streaming using demo preprocessed clips in demo/0001.
+    Emulate realtime streaming using prepared single-scene timeline data.
 
-    The ASD class is externally driven: stream data at realtime cadence in the main thread and
-    trigger infer() on a separate processing thread every trigger_interval_s.
-    Visualization shows the average score during last trigger window.
+    Loads tracks.json and media/audio.wav, then streams frames at FPS and pushes
+    audio globally and per-track cropped frames based on time-stamped bboxes.
+    Tracks are added/removed dynamically according to start/end frames.
     """
-    pycrop = os.path.join(video_folder, "pycrop")
-    avi_files = sorted(glob.glob(os.path.join(pycrop, "*.avi")))
-    assert len(avi_files) > 0, f"No face-crop avi clips found in {pycrop}. Run the demo first."
+    tracks_json_path = os.path.join(out_dir, "tracks.json")
+    with open(tracks_json_path, "r") as f:
+        data = json.load(f)
+
+    fps = float(data["video"]["fps"]) if "fps" in data["video"] else 25.0
+    frame_period = 1.0 / fps
+    frames_dir = os.path.join(out_dir, "media", "frames")
+    audio_path = data["video"]["audio_path"] if "audio_path" in data["video"] else os.path.join(out_dir, "media", "audio.wav")
+    sr, audio = wavfile.read(audio_path)
+    if audio.ndim > 1:
+        audio = audio[:, 0]
+    if audio.dtype != np.float32:
+        audio = audio.astype(np.float32)
+        if np.max(np.abs(audio)) > 1.0:
+            audio /= 32768.0
 
     # Initialize realtime ASD
     asd = ASDRealtime(
         model_path=model_path,
         window_seconds=10.0,
-        video_fps=25.0,
+        video_fps=fps,
         score_threshold=0,
     )
 
-    track_id = "t0"
-    asd.add_track(track_id)
+    # Build per-frame bbox lists for quick access
+    num_frames = int(data["video"].get("num_frames", 0))
+    tracks = data["tracks"]
+    # Index tracks by start/end
+    starts: Dict[int, List[Dict]] = {}
+    ends: Dict[int, List[Dict]] = {}
+    bbox_by_frame: Dict[str, Dict[int, List[float]]] = {}
+    for tr in tracks:
+        sf = int(tr["start_frame"]) ; ef = int(tr["end_frame"]) ; tid = tr["id"]
+        starts.setdefault(sf, []).append(tr)
+        ends.setdefault(ef, []).append(tr)
+        # Build bbox map
+        bbmap = {}
+        for item in tr["bboxes"]:
+            bbmap[int(item["frame"]) ] = list(item["bbox"])
+        bbox_by_frame[tid] = bbmap
 
+    # Viz setup
     if VISUALIZE_LOCALLY:
         cv2.namedWindow("LR-ASD Realtime", cv2.WINDOW_NORMAL)
+    out_dir_vis = os.path.join(out_dir, "realtime_vis")
+    os.makedirs(out_dir_vis, exist_ok=True)
+    out_path = os.path.join(out_dir_vis, "timeline_realtime_vis.avi")
+    fourcc = cv2.VideoWriter_fourcc(*"XVID")
+    writer = None
+    # Cache audio actually sent to ASD for muxing later
+    pushed_audio_chunks: List[np.ndarray] = []
 
-    # Prepare output directory for visualization videos
-    out_dir = os.path.join(video_folder, "pywork", "realtime_vis")
-    os.makedirs(out_dir, exist_ok=True)
+    # Shared results
+    results: Dict[str, Dict[str, float | bool | np.ndarray | None]] = {}
+    stop_evt = threading.Event()
 
-    for avi_path in avi_files:
-        wav_path = avi_path.replace(".avi", ".wav")
-        if not os.path.exists(wav_path):
-            print(f"Warning: missing audio for {avi_path}, skipping")
+    def processor_loop():
+        last_trigger_time = time.time()
+        while not stop_evt.is_set():
+            now = time.time()
+            if now - last_trigger_time >= trigger_interval_s:
+                res = asd.infer(min_required_seconds=0.5)
+                t_after_infer = time.time()
+                print(f"Infer took {t_after_infer - now:.3f}s")
+                for tid, r in res.items():
+                    series = r['series']
+                    N = max(1, int(round(trigger_interval_s * fps)))
+                    avg_score = float(np.mean(series[-N:]))
+                    results[tid] = {
+                        "score": avg_score,
+                        "decision": bool(avg_score >= asd.score_threshold),
+                        "series": series,
+                    }
+                last_trigger_time = now
+            time.sleep(0.005)
+
+    proc_thread = threading.Thread(target=processor_loop)
+    proc_thread.start()
+
+    # Streaming loop across global timeline
+    audio_per_frame = int(round(sr * frame_period))
+    active_tids: set[str] = set()
+    last_bb: Dict[str, List[float]] = {}
+
+    for fi in range(num_frames):
+        loop_start = time.time()
+        frame_path = os.path.join(frames_dir, f"{fi:06d}.jpg")
+        frame = cv2.imread(frame_path)
+        if frame is None:
+            # still maintain cadence
+            time.sleep(max(0, frame_period - (time.time() - loop_start)))
             continue
-        print(f"Streaming {os.path.basename(avi_path)} ...")
 
-        # Load audio fully; we will feed in small chunks to emulate streaming
-        sr, audio = wavfile.read(wav_path)
-        if audio.ndim > 1:
-            audio = audio[:, 0]
-        if audio.dtype != np.float32:
-            audio = audio.astype(np.float32)
-            if np.max(np.abs(audio)) > 1.0:
-                audio /= 32768.0
+        # Handle track starts
+        for tr in starts.get(fi, []):
+            tid = tr["id"]
+            if tid not in active_tids:
+                asd.add_track(tid)
+                active_tids.add(tid)
+                last_bb.pop(tid, None)
 
-        # Start audio playback for situational awareness
-        if VISUALIZE_LOCALLY:
-            play_obj = None
-            try:
-                if sd is not None:
-                    sd.stop()
-                    sd.play(audio, sr)
-                elif sa is not None:
-                    audio_i16 = (np.clip(audio, -1.0, 1.0) * 32767.0).astype(np.int16)
-                    play_obj = sa.play_buffer(audio_i16, 1, 2, sr)
-                else:
-                    print("Audio playback disabled (install 'sounddevice' or 'simpleaudio').")
-            except Exception as e:
-                print(f"Audio playback initialization failed: {e}")
+        # Handle track ends (we push frames for this frame before removal if needed)
+        end_now = [tr for tr in ends.get(fi, []) if tr["id"] in active_tids]
 
-        cap = cv2.VideoCapture(avi_path)
-        if not cap.isOpened():
-            print(f"Failed to open {avi_path}")
-            if sd is not None:
-                sd.stop()
-            elif play_obj is not None:
-                play_obj.stop()
-            continue
+        # Push audio slice for this frame
+        a_start = fi * audio_per_frame
+        a_end = min(len(audio), (fi + 1) * audio_per_frame)
+        if a_start < a_end:
+            chunk = audio[a_start:a_end]
+            asd.push_audio_samples(chunk, sr=sr)
+            pushed_audio_chunks.append(chunk)
 
-        # Realtime streaming settings
-        video_fps = 25.0
-        frame_period = 1.0 / video_fps
-        audio_chunk = int(round(frame_period * sr))
+        # Push per-track cropped frame for currently active tracks
+        for tid in list(active_tids):
+            bbmap = bbox_by_frame.get(tid, {})
+            if fi in bbmap:
+                last_bb[tid] = bbmap[fi]
+            bb = last_bb.get(tid)
+            if bb is None:
+                continue
+            x1, y1, x2, y2 = [int(round(v)) for v in bb]
+            x1, y1 = max(0, x1), max(0, y1)
+            x2, y2 = min(frame.shape[1]-1, x2), min(frame.shape[0]-1, y2)
+            roi = frame[y1:y2, x1:x2]
+            if roi.size == 0:
+                continue
+            asd.push_video_frame(tid, roi)
 
-        # Shared result between threads
-        result = {"score": None, "decision": False}
-        stop_evt = threading.Event()
+        # Remove tracks ending at this frame
+        for tr in end_now:
+            tid = tr["id"]
+            if tid in active_tids:
+                active_tids.remove(tid)
+                asd.remove_track(tid)
+                last_bb.pop(tid, None)
 
-        def processor_loop():
-            last_trigger_time = time.time()
-            while not stop_evt.is_set():
-                now = time.time()
-                if now - last_trigger_time >= trigger_interval_s:
-                    res = asd.infer(min_required_seconds=0.5)
-                    t_after_infer = time.time()
-                    print(f"  [t={now:.1f}] infer() took {t_after_infer - now:.3f}s")
-                    if track_id in res:
-                        series = res[track_id]['series']
-                        N = max(1, int(round(trigger_interval_s * video_fps)))
-                        avg_score = float(np.mean(series[-N:]))
-                        result["score"] = avg_score
-                        result["decision"] = bool(avg_score >= asd.score_threshold)
-                        print(f"  [t={now:.1f}] avg_score={avg_score:.3f} active={result['decision']}")
-                    else:
-                        print(f"  [t={now:.1f}] res: {res} No result for track {track_id}")
+        # Build visualization
+        vis = frame.copy()
+        for tid in active_tids:
+            bb = last_bb.get(tid)
+            if bb is None:
+                continue
+            x1, y1, x2, y2 = [int(round(v)) for v in bb]
 
-                    last_trigger_time = now
-                time.sleep(0.005)  # avoid busy-wait
+            r = results.get(tid, {})
+            score = r.get("score", None)
+            decision = r.get("decision", False)
 
-        proc_thread = threading.Thread(target=processor_loop)
-        proc_thread.start()
+            # Visualize the results on the frame
+            # Color: green if speaking, red if not
+            color = (0, 255, 0) if decision else (0, 0, 255)
+            cv2.rectangle(vis, (x1, y1), (x2, y2), color, 3)
+            txt = f"{tid} {score:.2f} act={int(decision)}" if score is not None else f"{tid} warm"
+            cv2.putText(vis, txt, (x1, max(0, y1 - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2, cv2.LINE_AA)
 
-        frame_idx = 0
-        # Video writer will be lazily initialized once frame size is known
-        writer = None
-        out_path = os.path.join(
-            out_dir,
-            f"{os.path.splitext(os.path.basename(avi_path))[0]}_realtime_vis.avi",
-        )
-        fourcc = cv2.VideoWriter_fourcc(*"XVID")  # AVI codec
-
-        # Collect audio chunks we push to ASD so we can mux them into the saved video
-        pushed_audio_chunks = []
-
-        while True:
-            loop_start = time.time()
-            ret, frame = cap.read()
-            if not ret:
-                break
-
-            # Push one frame at realtime cadence
-            asd.push_video_frame(track_id, frame)
-
-            # Push matching audio slice into ASD
-            a_start = frame_idx * audio_chunk
-            a_end = min(len(audio), (frame_idx + 1) * audio_chunk)
-            if a_start < a_end:
-                audio_chunk_data = audio[a_start:a_end]
-                asd.push_audio_samples(audio_chunk_data, sr=sr)
-                pushed_audio_chunks.append(audio_chunk_data)
-
-            # Visualization overlay (latest result from processor thread, no thread safety for now)
-            print(result)
-            last_score = result["score"]
-            decision = result["decision"]
-
-            vis = frame.copy()
-            txt = (
-                f"avg@{trigger_interval_s:.1f}s={last_score:.2f} active={int(decision)}"
-                if last_score is not None else "warming up..."
-            )
-            color = (0, 255, 0) if (last_score is not None and decision) else (0, 0, 255)
-            cv2.putText(vis, txt, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1.0, color, 2, cv2.LINE_AA)
-            h, w = vis.shape[:2]
-            cv2.rectangle(vis, (2, 2), (w - 3, h - 3), color, 3)
-
-            # Initialize writer when we know the size
-            if writer is None:
-                h_vis, w_vis = vis.shape[:2]
-                writer = cv2.VideoWriter(out_path, fourcc, video_fps, (w_vis, h_vis))
-                if not writer.isOpened():
-                    print(f"Warning: cannot open writer for {out_path}")
-                    writer = None
-
-            # Write visualization frame
-            if writer is not None:
-                writer.write(vis)
-
-            # Display and sleep to maintain realtime cadence
-            if VISUALIZE_LOCALLY:
-                cv2.imshow("LR-ASD Realtime", vis)
-                elapsed = time.time() - loop_start
-                delay_ms = max(1, int((frame_period - elapsed) * 1000)) if elapsed < frame_period else 1
-                key = cv2.waitKey(delay_ms)
-                if key & 0xFF == ord('q'):
-                    break
-            else:##If not visualizing, simply sleep to maintain cadence
-                elapsed = time.time() - loop_start
-                if elapsed < frame_period:
-                    time.sleep(frame_period - elapsed)
-
-            frame_idx += 1
-
-        # Cleanup this clip
-        stop_evt.set()
-        proc_thread.join(timeout=1.0)
-        cap.release()
-        # Finalize writer for this clip
+        if writer is None:
+            h_vis, w_vis = vis.shape[:2]
+            writer = cv2.VideoWriter(out_path, fourcc, fps, (w_vis, h_vis))
+            if not writer.isOpened():
+                print(f"Warning: cannot open writer for {out_path}")
+                writer = None
         if writer is not None:
-            try:
-                writer.release()
-                print(f"Saved visualization: {out_path}")
-            except Exception:
-                pass
+            writer.write(vis)
+
+        if VISUALIZE_LOCALLY:
+            cv2.imshow("LR-ASD Realtime", vis)
+            elapsed = time.time() - loop_start
+            delay_ms = max(1, int((frame_period - elapsed) * 1000)) if elapsed < frame_period else 1
+            key = cv2.waitKey(delay_ms)
+            if key & 0xFF == ord('q'):
+                break
+        else:
+            elapsed = time.time() - loop_start
+            if elapsed < frame_period:
+                time.sleep(frame_period - elapsed)
+
+    # Cleanup
+    stop_evt.set()
+    proc_thread.join(timeout=1.0)
+    if writer is not None:
         try:
-            if sd is not None:
-                sd.stop()
-            elif play_obj is not None:
-                play_obj.stop()
+            writer.release()
+            print(f"Saved visualization: {out_path}")
         except Exception:
             pass
-
-        # After saving the silent visualization video, mux in the exact audio we streamed to ASD
-        try:
-            if pushed_audio_chunks and os.path.exists(out_path):
-                audio_stream = np.concatenate(pushed_audio_chunks, axis=0)
-                # Ensure audio in int16 for WAV (ffmpeg path) while keeping MoviePy path in float32
-                out_base, out_ext = os.path.splitext(out_path)
-                out_mux_tmp = f"{out_base}__mux_tmp{out_ext}"
-
-                ffmpeg_path = shutil.which("ffmpeg")
-                if ffmpeg_path is not None:
-                    # Write a temporary WAV next to the video
-                    tmp_wav = f"{out_base}_tmp_audio.wav"
+    # Mux pushed audio into the saved visualization video
+    try:
+        if pushed_audio_chunks and os.path.exists(out_path):
+            audio_stream = np.concatenate(pushed_audio_chunks, axis=0)
+            out_base, out_ext = os.path.splitext(out_path)
+            out_mux_tmp = f"{out_base}__mux_tmp{out_ext}"
+            ffmpeg_path = shutil.which("ffmpeg")
+            if ffmpeg_path is not None:
+                tmp_wav = f"{out_base}_tmp_audio.wav"
+                try:
+                    wavfile.write(tmp_wav, sr, (np.clip(audio_stream, -1.0, 1.0) * 32767.0).astype(np.int16))
+                    cmd = [
+                        ffmpeg_path, "-y",
+                        "-i", out_path,
+                        "-i", tmp_wav,
+                        "-c:v", "copy",
+                        "-c:a", "pcm_s16le",
+                        "-shortest",
+                        out_mux_tmp,
+                    ]
+                    proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+                    if proc.returncode == 0 and os.path.exists(out_mux_tmp):
+                        os.replace(out_mux_tmp, out_path)
+                        print(f"Muxed audio into video: {out_path}")
+                    else:
+                        print("ffmpeg muxing failed for visualization")
+                finally:
                     try:
-                        wavfile.write(tmp_wav, sr, (np.clip(audio_stream, -1.0, 1.0) * 32767.0).astype(np.int16))
-                        cmd = [
-                            ffmpeg_path, "-y",
-                            "-i", out_path,
-                            "-i", tmp_wav,
-                            "-c:v", "copy",
-                            # Use PCM for AVI container compatibility
-                            "-c:a", "pcm_s16le",
-                            "-shortest",
-                            out_mux_tmp,
-                        ]
-                        proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-                        if proc.returncode == 0 and os.path.exists(out_mux_tmp):
-                            # Replace original file atomically
-                            os.replace(out_mux_tmp, out_path)
-                            print(f"Muxed audio into video: {out_path}")
-                        else:
-                            print("ffmpeg muxing failed, attempting MoviePy fallback...")
-                            raise RuntimeError("ffmpeg mux failed")
-                    finally:
-                        try:
-                            if os.path.exists(tmp_wav):
-                                os.remove(tmp_wav)
-                        except Exception:
-                            pass
-                else:
-                    # Fallback: try MoviePy (requires moviepy and imageio-ffmpeg)
-                    try:
-                        from moviepy.editor import VideoFileClip
-                        from moviepy.audio.AudioClip import AudioArrayClip
-
-                        clip = VideoFileClip(out_path)
-                        aud = AudioArrayClip(audio_stream.reshape(-1, 1).astype(np.float32), fps=sr)
-                        # Ensure audio matches video duration
-                        aud = aud.set_duration(clip.duration)
-                        clip = clip.set_audio(aud)
-                        # Write to temporary file matching container, then replace original
-                        clip.write_videofile(out_mux_tmp, codec="mpeg4", audio_codec="pcm_s16le", fps=video_fps, verbose=False, logger=None)
-                        clip.close()
-                        if os.path.exists(out_mux_tmp):
-                            os.replace(out_mux_tmp, out_path)
-                            print(f"Muxed audio into video: {out_path}")
-                    except Exception as e:
-                        print(f"MoviePy muxing failed: {e}. Audio will not be embedded.")
-        except Exception as e:
-            print(f"Audio muxing encountered an error: {e}")
-
+                        if os.path.exists(tmp_wav):
+                            os.remove(tmp_wav)
+                    except Exception:
+                        pass
+    except Exception as e:
+        print(f"Audio muxing encountered an error: {e}")
     cv2.destroyAllWindows()
 
 
 if __name__ == "__main__":
-    stream_demo_sequence(os.path.join("demo", "0002"))
+    # Example: use prepared data under demo/0002_prepared (run tests/test_prepare_data.py first)
+    prep_dir = os.path.join("demo", "0002_prepared")
+    if os.path.exists(os.path.join(prep_dir, "tracks.json")):
+        stream_prepared_timeline(prep_dir)
+    else:
+        print(f"Prepared directory not found: {prep_dir}. Run tests/test_prepare_data.py to generate it.")
