@@ -9,3 +9,5 @@ scikit-learn
 pandas
 gdown
 sounddevice
+moviepy
+imageio-ffmpeg
