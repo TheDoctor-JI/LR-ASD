@@ -1,0 +1,10 @@
+## Tested with python3.10
+python_speech_features
+scenedetect
+torchvision
+opencv-python
+scipy
+numpy
+scikit-learn
+pandas
+gdown
