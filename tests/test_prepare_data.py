@@ -101,11 +101,12 @@ def run_detection_and_tracking(
     iou_thres: float = 0.5,
     min_track: int = 10,
     num_failed_det: int = 10,
+    forced_fps: Optional[float] = None,
 ) -> Tuple[List[Track], Dict]:
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         raise RuntimeError(f"Failed to open video: {video_path}")
-    fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
+    fps = forced_fps if (forced_fps is not None) else (cap.get(cv2.CAP_PROP_FPS) or 25.0)
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
@@ -294,6 +295,7 @@ def main():
     parser.add_argument("--num_failed_det", type=int, default=10, help="Max missed frames before ending a track")
     parser.add_argument("--threads", type=int, default=4, help="Threads for ffmpeg operations")
     parser.add_argument("--sample_rate", type=int, default=16000, help="Audio sample rate")
+    parser.add_argument("--target_fps", type=float, default=25.0, help="Target FPS for CFR AVI conversion")
 
     args = parser.parse_args()
 
@@ -313,28 +315,44 @@ def main():
     else:
         resolved_device = args.device
 
-    # 0) Copy/convert video for reference under media
+    # 0) Convert input video to constant-FPS AVI for consistent timeline (like Columbia_test)
     video_copy_path = os.path.join(out_media, "video.avi")
     ensure_dir(out_media)
     try:
-        subprocess.run(["ffmpeg", "-y", "-i", args.video_path, "-c:v", "copy", "-c:a", "copy", video_copy_path, "-loglevel", "panic"], check=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-    except Exception:
-        # Fallback: just reference original path
-        video_copy_path = os.path.abspath(args.video_path)
+        # Re-encode to CFR AVI with MPEG-4 video for robust OpenCV decoding
+        subprocess.run([
+            "ffmpeg", "-y",
+            "-i", args.video_path,
+            "-r", str(args.target_fps),
+            "-vsync", "cfr",
+            "-c:v", "mpeg4",
+            "-qscale:v", "2",
+            "-pix_fmt", "yuv420p",
+            video_copy_path,
+            "-loglevel", "panic",
+        ], check=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    except Exception as e:
+        # Fallback: direct copy if re-encode fails
+        try:
+            subprocess.run(["ffmpeg", "-y", "-i", args.video_path, "-c:v", "copy", "-c:a", "copy", video_copy_path, "-loglevel", "panic"], check=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        except Exception:
+            video_copy_path = os.path.abspath(args.video_path)
 
     # 1) Extract audio (global timeline)
     audio_wav = os.path.join(out_media, "audio.wav")
-    extract_audio(args.video_path, audio_wav, sr=args.sample_rate, threads=args.threads)
+    # Extract from the CFR AVI to ensure alignment with frames
+    extract_audio(video_copy_path, audio_wav, sr=args.sample_rate, threads=args.threads)
 
     # 2) Detect & track across entire video while saving frames
     tracks, video_meta = run_detection_and_tracking(
-        args.video_path,
+        video_copy_path,
         out_frames,
         device=resolved_device,
         conf_th=args.conf_th,
         iou_thres=args.iou_thres,
         min_track=args.min_track,
         num_failed_det=args.num_failed_det,
+        forced_fps=float(args.target_fps),
     )
 
     # 3) Write per-track convenience media (face crops + audio slices)
