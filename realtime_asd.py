@@ -116,8 +116,16 @@ class ASDRealtime:
         """Push raw PCM audio samples shared by all tracks."""
         if samples is None or len(samples) == 0:
             return
+        # Convert to float32 and preserve official amplitude scale used in python_speech_features
+        # - If incoming is int16, keep full-scale magnitude by casting only
+        # - If incoming is float in [-1, 1], scale up to int16-equivalent (~*32768)
         if samples.dtype != np.float32:
             samples = samples.astype(np.float32)
+        # Heuristic: if peak <= 1.5, treat as normalized float and scale to int16 range
+        if samples.size:
+            maxabs = float(np.max(np.abs(samples)))
+            if maxabs <= 1.5:
+                samples = samples * 32768.0
         if sr is not None and sr != self.sample_rate:
             up = self.sample_rate
             down = int(sr)
@@ -225,7 +233,13 @@ class ASDRealtime:
 
         results: Dict[str, Dict[str, np.ndarray | float | bool]] = {}
         for i, tid in enumerate(ready_tracks):
+            # Apply 5-frame centered smoothing (±2) as in the official visualization
             series = scores_bt[i]
+            if series.size >= 1:
+                pad = 2
+                kernel = np.ones(5, dtype=np.float32) / 5.0
+                padded = np.pad(series.astype(np.float32), (pad, pad), mode='edge')
+                series = np.convolve(padded, kernel, mode='valid')
             last = float(series[-1])
             decision = bool(last >= self.score_threshold)
             self.last_score[tid] = last
