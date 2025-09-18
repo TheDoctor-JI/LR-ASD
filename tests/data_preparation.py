@@ -26,7 +26,7 @@ warnings.filterwarnings("ignore")
 # =========================
 
 # Input selection
-VIDEO_NAME = "0003"            # Demo video name (without extension)
+VIDEO_NAME = "0004"            # Demo video name (without extension)
 VIDEO_FOLDER = "demo"  # Path containing the input video and where outputs will be created
 
 # Preprocessing parameters (identical defaults to Columbia_test.py)

@@ -14,6 +14,11 @@ sys.path.append(os.path.join(os.path.dirname(__file__), '..'))  # for model impo
 
 from ASD import ASD
 
+# ========= Global realtime config =========
+TIME_WINDOW_SEC = 5.0  # sliding window length (seconds)
+USE_DUR_AVG = False      # True: multi-duration averaging; False: single pass on full window
+# =========================================
+
 
 class RealtimeCausalASD:
     """
@@ -63,9 +68,13 @@ class RealtimeCausalASD:
         self.dt = 1.0 / self.fps
         self.audio_sr = int(audio_sr)
         self.samples_per_tick = int(round(self.audio_sr / self.fps))  # 640 samples per frame at 16k/25fps
-        self.max_buffer_seconds = int(max_buffer_seconds)
-        self.max_audio_samples = self.max_buffer_seconds * self.audio_sr
-        self.max_video_frames = int(round(self.max_buffer_seconds * self.fps))
+
+        # Override buffer sizes by global TIME_WINDOW_SEC
+        self.time_window_sec = float(TIME_WINDOW_SEC)
+        self.max_buffer_seconds = int(round(self.time_window_sec))
+        self.max_audio_samples = int(round(self.time_window_sec * self.audio_sr))
+        self.max_video_frames = int(round(self.time_window_sec * self.fps))
+
 
         # Shared audio buffer (int16)
         self.audio_buffer = deque(maxlen=self.max_audio_samples)
@@ -83,6 +92,7 @@ class RealtimeCausalASD:
             "frames": deque(maxlen=self.max_video_frames),  # (112,112) uint8 frames at 25Hz
         }
         self.logger.info(f"Created person id={person_id}")
+        return person_id
 
     def delete_person(self, person_id: str) -> None:
         """Delete an existing person instance."""
@@ -140,19 +150,14 @@ class RealtimeCausalASD:
     def run_inference(self):
         """
         Run ASD once per active person using:
-          - Shared audio buffer (latest N seconds aligned to person's visual length).
-          - Person's visual buffer (112x112 frames).
+          - Shared audio window (last TIME_WINDOW_SEC seconds).
+          - Person's visual window (last TIME_WINDOW_SEC seconds, aligned from end).
+        Inference:
+          - If USE_DUR_AVG: multi-duration averaging (Columbia style).
+          - Else: single forward pass on full window, then 5-frame smoothing.
 
         Returns:
-          dict: person_id -> {
-            'scores': list[float],          # averaged across durations
-            'scores_smooth': list[float],   # 5-frame local smoothing (±2)
-            'frames_used': int,
-            'seconds_used': float,
-            'time_sec': float,              # inference wall time for this person
-          }
-
-        Logs per-person time and total time.
+          dict person_id -> {...}
         """
         total_t0 = time.perf_counter()
         results = {}
@@ -167,33 +172,33 @@ class RealtimeCausalASD:
         for pid, pdata in self.persons.items():
             t0 = time.perf_counter()
 
-            # Visual features
+            # Visual features (entire sliding window for this person)
             vid_frames = list(pdata["frames"])
             if len(vid_frames) == 0:
                 self.logger.debug(f"Person {pid}: no visual frames; skipping.")
                 continue
             videoFeature = np.stack(vid_frames, axis=0)  # (T,112,112), uint8
 
-            # Duration to use from audio (latest matching video duration)
+            # Duration to use from audio = current visual length (align from end, causal)
             seconds_needed = len(videoFeature) / self.fps
             samples_needed = int(round(seconds_needed * self.audio_sr))
             if samples_needed <= 0:
                 self.logger.debug(f"Person {pid}: insufficient audio duration; skipping.")
                 continue
 
-            # Align to the end (causal)
+            # Align to the end
             if len(audio_all) < samples_needed:
-                # Not enough audio yet; pad front with zeros
                 pad = np.zeros((samples_needed - len(audio_all),), dtype=np.int16)
                 audio_slice = np.concatenate([pad, audio_all], axis=0)
             else:
                 audio_slice = audio_all[-samples_needed:]
 
             # Audio MFCC @ 16k (matches Columbia_test)
-            audioFeature = python_speech_features.mfcc(audio_slice, samplerate=self.audio_sr, numcep=13, winlen=0.025, winstep=0.010)
+            audioFeature = python_speech_features.mfcc(
+                audio_slice, samplerate=self.audio_sr, numcep=13, winlen=0.025, winstep=0.010
+            )
 
             # Make audio/video lengths consistent per Columbia_test
-            # length = min((audio_frames - audio_frames%4)/100, video_frames)
             audio_frames = audioFeature.shape[0]
             if audio_frames == 0:
                 self.logger.debug(f"Person {pid}: no MFCC frames; skipping.")
@@ -210,61 +215,77 @@ class RealtimeCausalASD:
             audioFeature = audioFeature[:audio_len, :]
             videoFeature = videoFeature[:video_len, :, :]
 
-            # Multi-duration averaging (as in Columbia_test)
-            # This is similar to what people do in object detection with multiple anchors
-            durationSet = [1, 2, 3, 4, 5, 6]
-            allScore = []
-            with torch.no_grad():
-                for duration in durationSet:
-                    ## Chunk up the input into segments of 'duration' seconds, which are then sent to the model for forward pass
-                    batchSize = int(math.ceil(length_sec / duration))
-                    scores = []
-                    for i in range(batchSize):
-                        a0 = int(i * duration * 100)
-                        a1 = int((i + 1) * duration * 100)
-                        v0 = int(i * duration * 25)
-                        v1 = int((i + 1) * duration * 25)
-                        a_chunk = audioFeature[a0:a1, :]
-                        v_chunk = videoFeature[v0:v1, :, :]
+            if USE_DUR_AVG:
+                # Multi-duration averaging (Columbia_test pattern)
+                durationSet = [1, 1, 1, 2, 2, 2, 3, 3, 4, 5, 6]
+                allScore = []
+                with torch.no_grad():
+                    for duration in durationSet:
+                        batchSize = int(math.ceil(length_sec / duration))
+                        scores = []
+                        for i in range(batchSize):
+                            a0 = int(i * duration * 100)
+                            a1 = int((i + 1) * duration * 100)
+                            v0 = int(i * duration * 25)
+                            v1 = int((i + 1) * duration * 25)
+                            a_chunk = audioFeature[a0:a1, :]
+                            v_chunk = videoFeature[v0:v1, :, :]
 
-                        if a_chunk.shape[0] == 0 or v_chunk.shape[0] == 0:
-                            continue
+                            if a_chunk.shape[0] == 0 or v_chunk.shape[0] == 0:
+                                continue
 
-                        # To tensors with batch dim
-                        inputA = torch.FloatTensor(a_chunk).unsqueeze(0).cuda()
-                        inputV = torch.FloatTensor(v_chunk).unsqueeze(0).cuda()
+                            inputA = torch.FloatTensor(a_chunk).unsqueeze(0).cuda()
+                            inputV = torch.FloatTensor(v_chunk).unsqueeze(0).cuda()
 
-                        # Frontends and backend, same as Columbia_test
-                        embedA = self.asd.model.forward_audio_frontend(inputA)
-                        embedV = self.asd.model.forward_visual_frontend(inputV)
-                        out = self.asd.model.forward_audio_visual_backend(embedA, embedV)
+                            embedA = self.asd.model.forward_audio_frontend(inputA)
+                            embedV = self.asd.model.forward_visual_frontend(inputV)
+                            out = self.asd.model.forward_audio_visual_backend(embedA, embedV)
 
-                        # lossAV.forward(out, labels=None) may return tensor, ndarray, list, or scalar
-                        val = self.asd.lossAV.forward(out, labels=None)
+                            val = self.asd.lossAV.forward(out, labels=None)
 
-                        # Normalize to 1D list of floats
-                        if isinstance(val, torch.Tensor):
-                            vals = val.detach().cpu().numpy().ravel().tolist()
-                        elif isinstance(val, np.ndarray):
-                            vals = val.ravel().tolist()
-                        elif isinstance(val, (list, tuple)):
-                            vals = list(map(float, val))
-                        else:
-                            vals = [float(val)]
-                        scores.extend(vals)
+                            if isinstance(val, torch.Tensor):
+                                vals = val.detach().cpu().numpy().ravel().tolist()
+                            elif isinstance(val, np.ndarray):
+                                vals = val.ravel().tolist()
+                            elif isinstance(val, (list, tuple)):
+                                vals = list(map(float, val))
+                            else:
+                                vals = [float(val)]
+                            scores.extend(vals)
 
-                    if len(scores) > 0:
-                        allScore.append(np.array(scores, dtype=np.float32))
+                        if len(scores) > 0:
+                            allScore.append(np.array(scores, dtype=np.float32))
 
-            if len(allScore) == 0:
-                self.logger.debug(f"Person {pid}: got no scores; skipping.")
-                continue
+                if len(allScore) == 0:
+                    self.logger.debug(f"Person {pid}: got no scores; skipping.")
+                    continue
 
-            # Average across durations and round to 1 decimal, for each frame
-            avg_scores = np.mean(np.stack(allScore, axis=0), axis=0)
-            avg_scores = np.round(avg_scores, 1).astype(float)
+                avg_scores = np.mean(np.stack(allScore, axis=0), axis=0)
+                avg_scores = np.round(avg_scores, 1).astype(float)
 
-            # 5-frame smoothing (±2) like visualization() in Columbia_test
+            else:
+                # Single pass on the full window (aligned end, causal)
+                with torch.no_grad():
+                    inputA = torch.FloatTensor(audioFeature).unsqueeze(0).cuda()  # [1, A, 13]
+                    inputV = torch.FloatTensor(videoFeature).unsqueeze(0).cuda()  # [1, V, 112, 112]
+                    embedA = self.asd.model.forward_audio_frontend(inputA)
+                    embedV = self.asd.model.forward_visual_frontend(inputV)
+                    out = self.asd.model.forward_audio_visual_backend(embedA, embedV)
+                    val = self.asd.lossAV.forward(out, labels=None)
+
+                    if isinstance(val, torch.Tensor):
+                        avg_scores = val.detach().cpu().numpy().ravel().astype(float)
+                    elif isinstance(val, np.ndarray):
+                        avg_scores = val.ravel().astype(float)
+                    elif isinstance(val, (list, tuple)):
+                        avg_scores = np.array(list(map(float, val)), dtype=float)
+                    else:
+                        avg_scores = np.array([float(val)], dtype=float)
+
+                # Keep numeric consistency with the other branch
+                avg_scores = np.round(avg_scores, 1).astype(float)
+
+            # 5-frame smoothing (±2)
             smoothed = []
             for fidx in range(len(avg_scores)):
                 l = max(fidx - 2, 0)

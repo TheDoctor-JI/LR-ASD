@@ -15,7 +15,7 @@ warnings.filterwarnings("ignore")
 
 INTEGRATE_WITH_ASD = True
 REALTIME_EMULATION = False
-INFERENCE_PERIOD_SEC = 1.0  # T seconds; run inference every T seconds (or every N ticks when not realtime)
+INFERENCE_PERIOD_SEC = 0.1  # T seconds; run inference every T seconds (or every N ticks when not realtime)
 
 
 class SceneEmulator:
@@ -338,6 +338,8 @@ class SceneEmulator:
         )
         subprocess.call(cmd, shell=True, stdout=None)
 
+        print(f"Saved annotated video to {out_av_path}")
+
     def run(self, start_frame=0, end_frame=None):
         """
         Run emulation at 25 Hz. For each frame:
@@ -459,7 +461,7 @@ def _delete_track(person_id):
 
 if __name__ == "__main__":
     # Minimal demo usage:
-    base = os.path.join("demo", "0003")
+    base = os.path.join("demo", "0004")
     if len(sys.argv) > 1:
         base = sys.argv[1]
 
