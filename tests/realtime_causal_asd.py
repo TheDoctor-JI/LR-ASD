@@ -9,6 +9,9 @@ import numpy as np
 import torch
 import python_speech_features
 
+import sys, os
+sys.path.append(os.path.join(os.path.dirname(__file__), '..'))  # for model import
+
 from ASD import ASD
 
 
@@ -69,23 +72,19 @@ class RealtimeCausalASD:
 
         # Persons
         self.persons = {}  # id -> {'frames': deque of (112,112) uint8}
-        self.next_person_id = 0
 
         self.logger.info(f"Initialized RealtimeCausalASD: fps={self.fps}, sr={self.audio_sr}, max={self.max_buffer_seconds}s")
 
     # ------------- Person lifecycle -------------
 
-    def create_person(self) -> int:
+    def create_person(self, person_id: str) -> int:
         """Create a new person instance and return its id."""
-        pid = self.next_person_id
-        self.next_person_id += 1
-        self.persons[pid] = {
+        self.persons[person_id] = {
             "frames": deque(maxlen=self.max_video_frames),  # (112,112) uint8 frames at 25Hz
         }
-        self.logger.info(f"Created person id={pid}")
-        return pid
+        self.logger.info(f"Created person id={person_id}")
 
-    def delete_person(self, person_id: int) -> None:
+    def delete_person(self, person_id: str) -> None:
         """Delete an existing person instance."""
         if person_id not in self.persons:
             raise KeyError(f"Person id {person_id} does not exist")
@@ -108,7 +107,7 @@ class RealtimeCausalASD:
         for s in chunk:
             self.audio_buffer.append(int(s))
 
-    def push_visual_sample(self, person_id: int, face_img_bgr: np.ndarray, t_frame: int = None, t_sec: float = None) -> None:
+    def push_visual_sample(self, person_id: str, face_img_bgr: np.ndarray, t_frame: int = None, t_sec: float = None) -> None:
         """
         Append a 25Hz visual face sample for a given person after preprocessing:
           BGR -> gray -> resize(224x224) -> center-crop(112x112)
@@ -240,17 +239,19 @@ class RealtimeCausalASD:
                         embedV = self.asd.model.forward_visual_frontend(inputV)
                         out = self.asd.model.forward_audio_visual_backend(embedA, embedV)
 
-                        # lossAV.forward(out, labels=None) returns scores
-                        score = self.asd.lossAV.forward(out, labels=None)
-                        # score is iterable; extend list
-                        if isinstance(score, (list, tuple)):
-                            scores.extend(score)
+                        # lossAV.forward(out, labels=None) may return tensor, ndarray, list, or scalar
+                        val = self.asd.lossAV.forward(out, labels=None)
+
+                        # Normalize to 1D list of floats
+                        if isinstance(val, torch.Tensor):
+                            vals = val.detach().cpu().numpy().ravel().tolist()
+                        elif isinstance(val, np.ndarray):
+                            vals = val.ravel().tolist()
+                        elif isinstance(val, (list, tuple)):
+                            vals = list(map(float, val))
                         else:
-                            # tensor/ndarray -> list
-                            try:
-                                scores.extend(score.detach().cpu().numpy().tolist())
-                            except Exception:
-                                scores.append(float(score))
+                            vals = [float(val)]
+                        scores.extend(vals)
 
                     if len(scores) > 0:
                         allScore.append(np.array(scores, dtype=np.float32))

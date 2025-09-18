@@ -5,6 +5,7 @@ import json
 import glob
 import pickle
 import warnings
+import subprocess
 
 import cv2
 import numpy as np
@@ -14,6 +15,8 @@ warnings.filterwarnings("ignore")
 
 INTEGRATE_WITH_ASD = True
 REALTIME_EMULATION = False
+INFERENCE_PERIOD_SEC = 1.0  # T seconds; run inference every T seconds (or every N ticks when not realtime)
+
 
 class SceneEmulator:
     """
@@ -73,6 +76,8 @@ class SceneEmulator:
         self.fps = float(self.meta.get("fps", 25.0))
         self.dt = 1.0 / self.fps  # 0.04s
         self.crop_scale = float(crop_scale)  # must match data_preparation CROP_SCALE for identical crops
+        self.ticks_per_infer = max(1, int(round(INFERENCE_PERIOD_SEC * self.fps)))
+        self.window_frames = int(round(INFERENCE_PERIOD_SEC * self.fps))  # W = T * fps
 
         # Frames list (0-based indexing via list index)
         self.flist = sorted(glob.glob(os.path.join(self.frames_dir, "*.jpg")))
@@ -145,10 +150,17 @@ class SceneEmulator:
         self.delete_track_handle = delete_track_handle
         self.run_inference_handle = run_inference_handle
 
-        # Mapping from track_id -> person_id as returned by create_track_handle
+        # Mapping and active state
         self.track_to_person = {}
-        # Active set of track ids
+        self.person_to_track = {}
         self.active_track_ids = set()
+
+        # Online score buffers: per track, per-relative-frame
+        # Initialize lazily on track creation: np.full(track_len, np.nan)
+        self.track_scores = {}  # track_id -> np.ndarray (len = track_len)
+
+        # Count of frames pushed per person (for absolute mapping)
+        self.person_frame_counts = {}  # person_id -> int
 
     def _crop_face_224(self, img_bgr, cx, cy, s):
         """
@@ -186,6 +198,146 @@ class SceneEmulator:
         face = cv2.resize(face, (224, 224))
         return face
 
+    def _ensure_track_buffers(self, track_id):
+        if track_id not in self.track_scores:
+            tr = self.tracks_by_id[track_id]
+            length = tr["end"] - tr["start"] + 1
+            self.track_scores[track_id] = np.full((length,), np.nan, dtype=np.float32)
+
+    def _update_scores_from_results(self, results):
+        """
+        Take run_inference_handle() results and update per-track score buffers for only the last T seconds.
+        Expected results format per person:
+          results[pid] = {
+            "scores": [...],
+            "scores_smooth": [...],
+            "frames_used": int,
+            ...
+          }
+        We take the tail window_frames from scores_smooth, and map them to absolute frames.
+        """
+        if not results:
+            return
+        W = self.window_frames
+        for pid, res in results.items():
+            if pid not in self.person_to_track:
+                continue
+            track_id = self.person_to_track[pid]
+            self._ensure_track_buffers(track_id)
+
+            # Total frames sent so far for this person
+            cur_n = self.person_frame_counts.get(pid, 0)
+            if cur_n <= 0:
+                continue
+
+            scores = res.get("scores_smooth") or res.get("scores") or []
+            if not scores:
+                continue
+            L = len(scores)
+            k = min(W, L, cur_n)
+            if k <= 0:
+                continue
+            tail = np.asarray(scores[-k:], dtype=np.float32)
+
+            # Map to track-relative indices
+            tr = self.tracks_by_id[track_id]
+            rel_end = min(cur_n, tr["end"] - tr["start"] + 1)  # cap to track length
+            rel_start = max(rel_end - k, 0)
+            write_len = rel_end - rel_start
+            if write_len <= 0:
+                continue
+            self.track_scores[track_id][rel_start:rel_end] = tail[-write_len:]
+
+    def _finalize_and_visualize(self):
+        """
+        Save scores to intermediate/scores.pckl and create annotated video:
+          media/video_annotated.avi and media/video_annotated_with_audio.avi
+        Visualization follows the Columbia_test.py scheme (rect + score text, local smoothing ±2).
+        """
+        # Convert to list-of-lists (fill NaN via forward-fill then 0)
+        scores_list = []
+        for tr in self.tracks:
+            tid = tr["id"]
+            self._ensure_track_buffers(tid)
+            arr = self.track_scores[tid].copy()
+            # forward-fill then 0
+            if np.isnan(arr).all():
+                arr[:] = 0.0
+            else:
+                # forward fill
+                last = 0.0
+                for i in range(len(arr)):
+                    if np.isnan(arr[i]):
+                        arr[i] = last
+                    else:
+                        last = arr[i]
+            scores_list.append(arr.astype(float).tolist())
+
+        # Save
+        save_path = os.path.join(self.intermediate_dir, "scores.pckl")
+        with open(save_path, "wb") as f:
+            pickle.dump(scores_list, f)
+
+        # Build per-frame face overlays like Columbia_test.visualization
+        flist = self.flist
+        faces = [[] for _ in range(len(flist))]
+        for tidx, tr in enumerate(self.tracks):
+            scores = np.array(scores_list[tidx], dtype=np.float32)
+            rel_frames = np.arange(0, len(scores), dtype=np.int32)
+            abs_frames = tr["start"] + rel_frames
+            # For each rel frame, compute local smoothing ±2
+            for i, af in enumerate(abs_frames):
+                if af < 0 or af >= len(flist):
+                    continue
+                l = max(i - 2, 0)
+                r = min(i + 3, len(scores))
+                s_val = float(np.mean(scores[l:r]))
+                faces[af].append({
+                    "track": tidx,
+                    "score": s_val,
+                    "s": tr["s"][i],
+                    "x": tr["x"][i],
+                    "y": tr["y"][i],
+                })
+
+        # Write annotated video
+        first = cv2.imread(flist[0])
+        fh, fw = first.shape[:2]
+        out_path = os.path.join(self.media_dir, "video_annotated.avi")
+        vOut = cv2.VideoWriter(out_path, cv2.VideoWriter_fourcc(*"XVID"), 25, (fw, fh))
+        colorDict = {0: 0, 1: 255}
+        for fidx, fname in enumerate(flist):
+            image = cv2.imread(fname)
+            for face in faces[fidx]:
+                clr = colorDict[int((face["score"] >= 0))]
+                txt = round(face["score"], 1)
+                cv2.rectangle(
+                    image,
+                    (int(face["x"] - face["s"]), int(face["y"] - face["s"])),
+                    (int(face["x"] + face["s"]), int(face["y"] + face["s"])),
+                    (0, clr, 255 - clr),
+                    10,
+                )
+                cv2.putText(
+                    image,
+                    f"{txt}",
+                    (int(face["x"] - face["s"]), int(face["y"] - face["s"])),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    1.5,
+                    (0, clr, 255 - clr),
+                    5,
+                )
+            vOut.write(image)
+        vOut.release()
+
+        # Mux audio
+        audio_path = os.path.join(self.media_dir, "audio.wav")
+        out_av_path = os.path.join(self.media_dir, "video_annotated_with_audio.avi")
+        cmd = (
+            f"ffmpeg -y -i {out_path} -i {audio_path} -threads 4 -c:v copy -c:a copy {out_av_path} -loglevel panic"
+        )
+        subprocess.call(cmd, shell=True, stdout=None)
+
     def run(self, start_frame=0, end_frame=None):
         """
         Run emulation at 25 Hz. For each frame:
@@ -193,7 +345,7 @@ class SceneEmulator:
           - create new tracks starting at this frame
           - send one visual sample per active track
           - delete tracks that end at this frame (after sending their last sample)
-          - call run_inference_handle (if provided)
+          - call run_inference_handle (every T seconds if provided)
         If REALTIME_EMULATION = True, sleep to maintain 25 Hz wall-clock rate. if not, run as fast as possible and allow the interval to be longer than 40 ms if needed (e.g. due to inference time)
 
         Arguments:
@@ -202,6 +354,8 @@ class SceneEmulator:
         """
         t_start = int(start_frame)
         t_end = int(end_frame) if end_frame is not None else self.num_frames
+        infer_tick_budget = self.ticks_per_infer
+        tick_since_infer = 0
 
         for t in range(t_start, min(t_end, self.num_frames)):
             wall_tick_start = time.perf_counter()
@@ -220,13 +374,14 @@ class SceneEmulator:
 
             # 2) Create new tracks that start now
             for tr in self.starts_at.get(t, []):
-                # Let the handler create a corresponding person; store mapping
                 pid = self.create_track_handle(tr["id"])
                 if pid is None:
-                    # If handler does not return an id, default to using track id
                     pid = tr["id"]
                 self.track_to_person[tr["id"]] = pid
+                self.person_to_track[pid] = tr["id"]
                 self.active_track_ids.add(tr["id"])
+                self.person_frame_counts[pid] = 0
+                self._ensure_track_buffers(tr["id"])
 
             # 3) Visual samples for all currently active tracks
             img_bgr = cv2.imread(self.flist[t])
@@ -235,15 +390,24 @@ class SceneEmulator:
                     tr = self.tracks_by_id[track_id]
                     if not (tr["start"] <= t <= tr["end"]):
                         continue
-                    idx = t - tr["start"]  # index into this track's arrays
+                    idx = t - tr["start"]
                     cx = tr["x"][idx]
                     cy = tr["y"][idx]
                     s = tr["s"][idx]
                     face_224 = self._crop_face_224(img_bgr, cx, cy, s)
                     person_id = self.track_to_person.get(track_id, track_id)
                     self.send_visual_sample_handle(person_id, face_224, t, t_sec_start)
+                    # Update count of frames pushed for this person
+                    self.person_frame_counts[person_id] = self.person_frame_counts.get(person_id, 0) + 1
 
-            # 4) Delete tracks that finish at this frame (after sending last sample)
+            # 4) Conditional inference every T seconds (N ticks)
+            tick_since_infer += 1
+            if self.run_inference_handle is not None and tick_since_infer >= infer_tick_budget:
+                results = self.run_inference_handle()  # dict per person
+                self._update_scores_from_results(results)
+                tick_since_infer = 0
+
+            # 5) Delete tracks that finish at this frame (after sending last sample)
             for tr in self.ends_at.get(t, []):
                 tid = tr["id"]
                 if tid in self.active_track_ids:
@@ -251,13 +415,19 @@ class SceneEmulator:
                     self.delete_track_handle(person_id)
                     self.active_track_ids.discard(tid)
                     self.track_to_person.pop(tid, None)
-
-            # 5) Run inference once per tick (optional)
-            if self.run_inference_handle is not None:
-                _ = self.run_inference_handle()
+                    self.person_to_track.pop(person_id, None)
+                    self.person_frame_counts.pop(person_id, None)
 
             if REALTIME_EMULATION:
                 self._sleep_to_rate(wall_tick_start)
+
+        # Final inference once more at the end (to flush tail)
+        if self.run_inference_handle is not None:
+            results = self.run_inference_handle()
+            self._update_scores_from_results(results)
+
+        # Save and visualize
+        self._finalize_and_visualize()
 
     def _sleep_to_rate(self, tick_start_time):
         elapsed = time.perf_counter() - tick_start_time
