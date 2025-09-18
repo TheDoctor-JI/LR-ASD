@@ -1,4 +1,4 @@
-import sys, time, os, tqdm, glob, subprocess, warnings, cv2, pickle, numpy
+import sys, time, os, tqdm, glob, subprocess, warnings, cv2, pickle, numpy, json
 
 from types import SimpleNamespace
 from scipy import signal
@@ -200,7 +200,7 @@ def crop_video(args, track, cropFile):
 	audioEnd    = (track['frame'][-1]+1) / 25
 	vOut.release()
 	command = ("ffmpeg -y -i %s -async 1 -ac 1 -vn -acodec pcm_s16le -ar 16000 -threads %d -ss %.3f -to %.3f %s -loglevel panic" % \
-		      (args.audioFilePath, args.nDataLoaderThread, audioStart, audioEnd, audioTmp)) 
+			  (args.audioFilePath, args.nDataLoaderThread, audioStart, audioEnd, audioTmp)) 
 	output = subprocess.call(command, shell=True, stdout=None) # Crop audio file
 	_, audio = wavfile.read(audioTmp)
 	command = ("ffmpeg -y -i %st.avi -i %s -threads %d -c:v copy -c:a copy %s.avi -loglevel panic" % \
@@ -312,6 +312,36 @@ def main():
 	with open(savePath, 'wb') as fil:
 		pickle.dump(vidTracks, fil)
 	sys.stderr.write(time.strftime("%Y-%m-%d %H:%M:%S") + f" Cropped face clips saved in {args.faceClipsPath}\n")
+
+	# Generate metadata JSON (timelines are for media/video.avi @ 25 fps)
+	meta = {
+		'video_path': args.videoFilePath,
+		'fps': 25.0,
+		'num_tracks': len(vidTracks),
+		'tracks': []
+	}
+	for ii, vt in enumerate(vidTracks):
+		frames = vt['track']['frame']
+		start_frame = int(frames[0])
+		end_frame = int(frames[-1])
+		start_sec = start_frame / 25.0
+		end_sec = (end_frame + 1) / 25.0
+		base = os.path.join(args.faceClipsPath, f"{ii:05d}")
+		meta['tracks'].append({
+			'id': ii,
+			'start_frame': start_frame,
+			'end_frame': end_frame,
+			'num_frames': end_frame - start_frame + 1,
+			'start_sec': start_sec,
+			'end_sec': end_sec,
+			'clip_video': base + '.avi',
+			'clip_audio': base + '.wav'
+		})
+	meta_path = os.path.join(args.savePath, 'metadata.json')
+	with open(meta_path, 'w') as f:
+		json.dump(meta, f, indent=2)
+	sys.stderr.write(time.strftime("%Y-%m-%d %H:%M:%S") + f" Metadata written to {meta_path}\n")
+
 
 if __name__ == '__main__':
 	main()
