@@ -16,7 +16,7 @@ sys.path.append(os.path.join(os.path.dirname(__file__), '..'))  # for model impo
 from ASD import ASD
 
 # ========= Global realtime config =========
-CUDA_DEVICE = os.environ.get("ASD_CUDA_DEVICE", "cuda:0")  # unified device handle
+CUDA_DEVICE = os.environ.get("ASD_CUDA_DEVICE", "cuda:1")  # unified device handle
 TIME_WINDOW_SEC = 5.0  # sliding window length (seconds)
 USE_DUR_AVG = False      # True: multi-duration averaging; False: single pass on full window
 DEBUG_TIME = True
@@ -64,6 +64,14 @@ class RealtimeCausalASD:
             device = CUDA_DEVICE
         self.device_str = device
         self.device = torch.device(self.device_str)
+        # Enforce active device to avoid default cuda:0 allocations
+        if self.device.type == 'cuda':
+            try:
+                # If device string includes index (e.g., cuda:1) set it explicitly
+                if ':' in self.device_str:
+                    torch.cuda.set_device(self.device)
+            except Exception as e:
+                self.logger.warning(f"Failed to set CUDA device {self.device_str}: {e}")
 
         self.asd = ASD(device=self.device_str)
         if pretrain_model_path:

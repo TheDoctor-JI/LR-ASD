@@ -87,7 +87,8 @@ class ASD(nn.Module):
 
     def loadParameters(self, path):
         selfState = self.state_dict()
-        loadedState = torch.load(path)
+        # Load directly onto target device to avoid staging on cuda:0
+        loadedState = torch.load(path, map_location=self.device)
         for name, param in loadedState.items():
             origName = name;
             if name not in selfState:
