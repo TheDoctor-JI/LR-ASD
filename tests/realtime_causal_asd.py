@@ -17,6 +17,7 @@ from ASD import ASD
 # ========= Global realtime config =========
 TIME_WINDOW_SEC = 5.0  # sliding window length (seconds)
 USE_DUR_AVG = False      # True: multi-duration averaging; False: single pass on full window
+DEBUG_TIME = True
 # =========================================
 
 
@@ -159,7 +160,8 @@ class RealtimeCausalASD:
         Returns:
           dict person_id -> {...}
         """
-        total_t0 = time.perf_counter()
+        if DEBUG_TIME:
+            total_t0 = time.perf_counter()
         results = {}
 
         # Snapshot audio buffer as np.int16
@@ -170,7 +172,9 @@ class RealtimeCausalASD:
 
         # Iterate persons
         for pid, pdata in self.persons.items():
-            t0 = time.perf_counter()
+            
+            if DEBUG_TIME:
+                t0 = time.perf_counter()
 
             # Visual features (entire sliding window for this person)
             vid_frames = list(pdata["frames"])
@@ -292,7 +296,10 @@ class RealtimeCausalASD:
                 r = min(fidx + 3, len(avg_scores))
                 smoothed.append(float(np.mean(avg_scores[l:r])))
 
-            t1 = time.perf_counter()
+            if DEBUG_TIME:
+                t1 = time.perf_counter()
+                self.logger.info(f"Inference person={pid} frames={len(avg_scores)} time={t1 - t0:.3f}s")
+    
             results[pid] = {
                 "scores": avg_scores.tolist(),
                 "scores_smooth": smoothed,
@@ -300,8 +307,9 @@ class RealtimeCausalASD:
                 "seconds_used": len(avg_scores) / self.fps,
                 "time_sec": t1 - t0,
             }
-            self.logger.info(f"Inference person={pid} frames={len(avg_scores)} time={t1 - t0:.3f}s")
 
-        total_t1 = time.perf_counter()
-        self.logger.info(f"Total inference time: {total_t1 - total_t0:.3f}s for {len(results)} persons")
+        if DEBUG_TIME:
+            total_t1 = time.perf_counter()
+            self.logger.info(f"Total inference time: {total_t1 - total_t0:.3f}s for {len(results)} persons")
+            
         return results
