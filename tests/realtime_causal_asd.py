@@ -16,6 +16,7 @@ sys.path.append(os.path.join(os.path.dirname(__file__), '..'))  # for model impo
 from ASD import ASD
 
 # ========= Global realtime config =========
+CUDA_DEVICE = os.environ.get("ASD_CUDA_DEVICE", "cuda:0")  # unified device handle
 TIME_WINDOW_SEC = 5.0  # sliding window length (seconds)
 USE_DUR_AVG = False      # True: multi-duration averaging; False: single pass on full window
 DEBUG_TIME = True
@@ -43,7 +44,7 @@ class RealtimeCausalASD:
         max_buffer_seconds: int = 10,
         fps: float = 25.0,
         audio_sr: int = 16000,
-        device: str = "cuda",
+        device: str = None,
         log_level=logging.INFO,
     ):
         """
@@ -58,7 +59,13 @@ class RealtimeCausalASD:
         self.logger = logging.getLogger("RealtimeCausalASD")
 
         # Model setup (mirrors ASD class usage in Columbia_test)
-        self.asd = ASD()
+        # Device resolution
+        if device is None:
+            device = CUDA_DEVICE
+        self.device_str = device
+        self.device = torch.device(self.device_str)
+
+        self.asd = ASD(device=self.device_str)
         if pretrain_model_path:
             self.asd.loadParameters(pretrain_model_path)
             self.logger.info(f"Loaded ASD weights from {pretrain_model_path}")
@@ -284,8 +291,8 @@ class RealtimeCausalASD:
                             if a_chunk.shape[0] == 0 or v_chunk.shape[0] == 0:
                                 continue
 
-                            inputA = torch.FloatTensor(a_chunk).unsqueeze(0).cuda()
-                            inputV = torch.FloatTensor(v_chunk).unsqueeze(0).cuda()
+                            inputA = torch.FloatTensor(a_chunk).unsqueeze(0).to(self.device)
+                            inputV = torch.FloatTensor(v_chunk).unsqueeze(0).to(self.device)
 
                             embedA = self.asd.model.forward_audio_frontend(inputA)
                             embedV = self.asd.model.forward_visual_frontend(inputV)
@@ -318,8 +325,8 @@ class RealtimeCausalASD:
             else:
                 # Single pass on the full window (aligned end, causal)
                 with torch.no_grad():
-                    inputA = torch.FloatTensor(audioFeature).unsqueeze(0).cuda()  # [1, A, 13]
-                    inputV = torch.FloatTensor(videoFeature).unsqueeze(0).cuda()  # [1, V, 112, 112]
+                    inputA = torch.FloatTensor(audioFeature).unsqueeze(0).to(self.device)  # [1, A, 13]
+                    inputV = torch.FloatTensor(videoFeature).unsqueeze(0).to(self.device)  # [1, V, 112, 112]
                     embedA = self.asd.model.forward_audio_frontend(inputA)
                     embedV = self.asd.model.forward_visual_frontend(inputV)
                     out = self.asd.model.forward_audio_visual_backend(embedA, embedV)
