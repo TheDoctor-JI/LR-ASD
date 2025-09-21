@@ -36,9 +36,9 @@ class SceneEmulator:
     Handlers:
       - create_track_handle(track_id) -> person_id
       - delete_track_handle(person_id) -> None
-      - send_audio_sample_handle(chunk, t_frame, t_sec_start, t_sec_end) -> None
+      - send_audio_sample_handle(chunk) -> None
           chunk: np.ndarray (640,), int16 (40 ms @ 16 kHz)
-      - send_visual_sample_handle(person_id, face_img_224_bgr, t_frame, t_sec) -> None
+      - send_visual_sample_handle(person_id, face_img_224_bgr) -> None
           face_img_224_bgr: np.ndarray (224, 224, 3), uint8 (BGR)
       - run_inference_handle() -> Any
         Called once per tick after pushing all samples.
@@ -370,9 +370,7 @@ class SceneEmulator:
                 pad = np.zeros((self.samples_per_tick - chunk.shape[0],), dtype=self.audio.dtype)
                 chunk = np.concatenate([chunk, pad], axis=0)
 
-            t_sec_start = t / self.fps
-            t_sec_end = (t + 1) / self.fps
-            self.send_audio_sample_handle(chunk, t, t_sec_start, t_sec_end)
+            self.send_audio_sample_handle(chunk)
 
             # 2) Create new tracks that start now
             for tr in self.starts_at.get(t, []):
@@ -398,7 +396,7 @@ class SceneEmulator:
                     s = tr["s"][idx]
                     face_224 = self._crop_face_224(img_bgr, cx, cy, s)
                     person_id = self.track_to_person.get(track_id, track_id)
-                    self.send_visual_sample_handle(person_id, face_224, t, t_sec_start)
+                    self.send_visual_sample_handle(person_id, face_224)
                     # Update count of frames pushed for this person
                     self.person_frame_counts[person_id] = self.person_frame_counts.get(person_id, 0) + 1
 
@@ -438,14 +436,14 @@ class SceneEmulator:
             time.sleep(remaining)
 
 
-def _print_audio(chunk, t, t0, t1):
+def _print_audio(chunk):
     # Example audio handler
-    print(f"[A] t={t:06d} {t0:.3f}-{t1:.3f}s samples={chunk.shape[0]}")
+    print(f"[A] samples={chunk.shape[0]}")
 
 
-def _print_visual(person_id, face_img, t, t_sec):
+def _print_visual(person_id, face_img):
     # Example visual handler
-    print(f"[V] t={t:06d} {t_sec:.3f}s person={person_id} face={tuple(face_img.shape)}")
+    print(f"[V] person={person_id} face={tuple(face_img.shape)}")
 
 
 def _create_track(track_id):

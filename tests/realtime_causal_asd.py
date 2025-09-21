@@ -119,8 +119,10 @@ class RealtimeCausalASD:
         self.logger.info(f"Deleted person id={person_id}")
 
     # ------------- Streaming inputs -------------
-
-    def push_audio_sample(self, chunk: np.ndarray, t_frame: int = None, t_sec_start: float = None, t_sec_end: float = None) -> None:
+    '''
+    In the current implementation, the alignment between audio and visual data assumes external source driving the streaming at a fixed rate of 25Hz.
+    '''
+    def push_audio_sample(self, chunk: np.ndarray) -> None:
         """
         Append a 40ms mono audio chunk (shape (640,), int16) to the shared audio buffer.
         Importantly: this model assumes 25Hz audio-visual input, so the 40ms chunk size is fixed. Plus the fixed sample rate of 16kHz, yielding the 640 samples per chunk expected here.
@@ -135,7 +137,7 @@ class RealtimeCausalASD:
         for s in chunk:
             self.audio_buffer.append(int(s))
 
-    def push_visual_sample(self, person_id: str, face_img_bgr: np.ndarray, t_frame: int = None, t_sec: float = None) -> None:
+    def push_visual_sample(self, person_id: str, face_img_bgr: np.ndarray) -> None:
         """
         Append a 25Hz visual face sample for a given person after preprocessing:
           BGR -> gray -> resize(224x224) -> center-crop(112x112)
