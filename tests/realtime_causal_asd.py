@@ -3,6 +3,7 @@ import time
 import math
 import logging
 from collections import deque
+from typing import List, Optional, Dict, Any
 
 import cv2
 import numpy as np
@@ -107,6 +108,7 @@ class RealtimeCausalASD:
     def push_audio_sample(self, chunk: np.ndarray, t_frame: int = None, t_sec_start: float = None, t_sec_end: float = None) -> None:
         """
         Append a 40ms mono audio chunk (shape (640,), int16) to the shared audio buffer.
+        Importantly: this model assumes 25Hz audio-visual input, so the 40ms chunk size is fixed. Plus the fixed sample rate of 16kHz, yielding the 640 samples per chunk expected here.
         """
         if not isinstance(chunk, np.ndarray):
             raise TypeError("chunk must be a numpy array")
@@ -148,30 +150,66 @@ class RealtimeCausalASD:
 
     # ------------- Inference -------------
 
-    def run_inference(self):
-        """
-        Run ASD once per active person using:
-          - Shared audio window (last TIME_WINDOW_SEC seconds).
-          - Person's visual window (last TIME_WINDOW_SEC seconds, aligned from end).
-        Inference:
-          - If USE_DUR_AVG: multi-duration averaging (Columbia style).
-          - Else: single forward pass on full window, then 5-frame smoothing.
+    def run_inference(self, target_persons: Optional[List[str]] = None) -> Dict[str, Optional[Dict[str, Any]]]:
+        """Run ASD inference.
+
+        Behaviour:
+          - If target_persons is None: run over all existing persons (original behaviour).
+          - If target_persons is provided: restrict to those ids (order preserved). For any
+            requested id that lacks sufficient data, include the id in the returned dict
+            with value None.
+
+        Data sufficiency (causes a None result) includes any of these conditions:
+          * No audio buffered (global) or not enough audio after alignment.
+          * Person has no visual frames.
+          * Derived MFCC has zero frames.
+          * Computed effective length_sec <= 0.
+          * (Multi-duration mode) No scores produced.
+
+        Processing (when sufficient):
+          - Shared audio window (causal, last TIME_WINDOW_SEC seconds / needed duration).
+          - Person's visual frames (causal alignment from end).
+          - If USE_DUR_AVG: multi-duration averaging (Columbia style durations).
+          - Else: single forward pass on full window, then 5-frame (±2) smoothing.
+
+        Args:
+          target_persons: Optional list of person ids to run. Unknown ids raise KeyError.
 
         Returns:
-          dict person_id -> {...}
+          dict person_id -> result dict or None (insufficient data if explicitly requested).
         """
         if DEBUG_TIME:
             total_t0 = time.perf_counter()
-        results = {}
+        results: Dict[str, Optional[Dict[str, Any]]] = {}
+
+        # Determine which persons to process
+        if target_persons is None:
+            person_id_list = list(self.persons.keys())
+        else:
+            # Preserve order, validate existence, de-duplicate
+            seen = set()
+            person_id_list = []
+            for pid in target_persons:
+                if pid in seen:
+                    continue
+                if pid not in self.persons:
+                    raise KeyError(f"Person id {pid} does not exist")
+                seen.add(pid)
+                person_id_list.append(pid)
 
         # Snapshot audio buffer as np.int16
         if len(self.audio_buffer) == 0:
-            self.logger.warning("Audio buffer is empty; skipping inference for all persons.")
+            self.logger.warning("Audio buffer is empty; skipping inference.")
+            # If a target list was provided, populate with None; else mimic previous empty return
+            if target_persons is not None:
+                for pid in person_id_list:
+                    results[pid] = None
             return results
         audio_all = np.frombuffer(np.asarray(self.audio_buffer, dtype=np.int16).tobytes(), dtype=np.int16)
 
-        # Iterate persons
-        for pid, pdata in self.persons.items():
+        # Iterate selected persons
+        for pid in person_id_list:
+            pdata = self.persons[pid]
             
             if DEBUG_TIME:
                 t0 = time.perf_counter()
@@ -179,7 +217,9 @@ class RealtimeCausalASD:
             # Visual features (entire sliding window for this person)
             vid_frames = list(pdata["frames"])
             if len(vid_frames) == 0:
-                self.logger.debug(f"Person {pid}: no visual frames; skipping.")
+                self.logger.debug(f"Person {pid}: no visual frames; insufficient data.")
+                if target_persons is not None:
+                    results[pid] = None
                 continue
             videoFeature = np.stack(vid_frames, axis=0)  # (T,112,112), uint8
 
@@ -187,7 +227,9 @@ class RealtimeCausalASD:
             seconds_needed = len(videoFeature) / self.fps
             samples_needed = int(round(seconds_needed * self.audio_sr))
             if samples_needed <= 0:
-                self.logger.debug(f"Person {pid}: insufficient audio duration; skipping.")
+                self.logger.debug(f"Person {pid}: insufficient audio duration; insufficient data.")
+                if target_persons is not None:
+                    results[pid] = None
                 continue
 
             # Align to the end
@@ -205,12 +247,16 @@ class RealtimeCausalASD:
             # Make audio/video lengths consistent per Columbia_test
             audio_frames = audioFeature.shape[0]
             if audio_frames == 0:
-                self.logger.debug(f"Person {pid}: no MFCC frames; skipping.")
+                self.logger.debug(f"Person {pid}: no MFCC frames; insufficient data.")
+                if target_persons is not None:
+                    results[pid] = None
                 continue
 
             length_sec = min((audio_frames - audio_frames % 4) / 100.0, float(videoFeature.shape[0]))
             if length_sec <= 0:
-                self.logger.debug(f"Person {pid}: computed length <= 0; skipping.")
+                self.logger.debug(f"Person {pid}: computed length <= 0; insufficient data.")
+                if target_persons is not None:
+                    results[pid] = None
                 continue
 
             # Trim to integer counts
@@ -261,7 +307,9 @@ class RealtimeCausalASD:
                             allScore.append(np.array(scores, dtype=np.float32))
 
                 if len(allScore) == 0:
-                    self.logger.debug(f"Person {pid}: got no scores; skipping.")
+                    self.logger.debug(f"Person {pid}: got no scores; insufficient data.")
+                    if target_persons is not None:
+                        results[pid] = None
                     continue
 
                 avg_scores = np.mean(np.stack(allScore, axis=0), axis=0)
@@ -311,5 +359,5 @@ class RealtimeCausalASD:
         if DEBUG_TIME:
             total_t1 = time.perf_counter()
             self.logger.info(f"Total inference time: {total_t1 - total_t0:.3f}s for {len(results)} persons")
-            
+
         return results
