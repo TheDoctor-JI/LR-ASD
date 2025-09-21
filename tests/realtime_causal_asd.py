@@ -46,6 +46,7 @@ class RealtimeCausalASD:
         audio_sr: int = 16000,
         device: str = None,
         log_level=logging.INFO,
+        parent_logger = None
     ):
         """
         Args:
@@ -55,8 +56,11 @@ class RealtimeCausalASD:
           audio_sr: audio sample rate (16000).
           device: 'cuda' (default, as ASD assumes CUDA) or 'cpu' if adapted.
         """
-        logging.basicConfig(level=log_level, format="%(asctime)s %(levelname)s: %(message)s")
-        self.logger = logging.getLogger("RealtimeCausalASD")
+        if parent_logger is None:
+            logging.basicConfig(level=log_level, format="%(asctime)s %(levelname)s: %(message)s")
+            self.logger = logging.getLogger("RealtimeCausalASD")
+        else:
+            self.logger = parent_logger.getChild('LRASD')
 
         # Model setup (mirrors ASD class usage in Columbia_test)
         # Device resolution
