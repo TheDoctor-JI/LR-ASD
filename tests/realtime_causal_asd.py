@@ -19,7 +19,7 @@ from ASD import ASD
 CUDA_DEVICE = os.environ.get("ASD_CUDA_DEVICE", "cuda:1")  # unified device handle
 TIME_WINDOW_SEC = 5.0  # sliding window length (seconds)
 USE_DUR_AVG = False      # True: multi-duration averaging; False: single pass on full window
-DEBUG_TIME = True
+DEBUG_TIME = False
 # =========================================
 
 
@@ -374,7 +374,7 @@ class RealtimeCausalASD:
                 "scores_smooth": smoothed,
                 "frames_used": len(avg_scores),
                 "seconds_used": len(avg_scores) / self.fps,
-                "time_sec": t1 - t0,
+                "time_sec": t1 - t0 if DEBUG_TIME else None
             }
 
         if DEBUG_TIME:
