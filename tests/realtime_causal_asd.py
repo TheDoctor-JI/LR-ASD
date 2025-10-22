@@ -104,6 +104,54 @@ class RealtimeCausalASD:
         self.persons = {}  # id -> {'frames': deque of (112,112) uint8}
 
         self.logger.info(f"Initialized RealtimeCausalASD: fps={self.fps}, sr={self.audio_sr}, max={self.max_buffer_seconds}s")
+        
+        # Warm-up: run dummy forward pass to initialize CUDA kernels and compile operations
+        self._warmup_model()
+        self.logger.info("Model warm-up completed")
+
+    def _warmup_model(self):
+        """
+        Warm up the model by running a dummy forward pass.
+        This pre-compiles CUDA kernels and initializes all operations to ensure
+        subsequent inference runs smoothly without initialization overhead.
+        All temporary tensors and state are explicitly cleaned up after warm-up.
+        """
+        try:
+            self.logger.info("Starting model warm-up...")
+            
+            # Create dummy inputs matching typical inference dimensions
+            # Audio: ~1 second of data -> 100 MFCC frames (at 10ms hop)
+            dummy_audio_frames = 100
+            dummy_audio = torch.randn(1, dummy_audio_frames, 13, dtype=torch.float32).to(self.device)
+            
+            # Video: ~1 second of data -> 25 frames at 25fps
+            dummy_video_frames = 25
+            dummy_video = torch.randn(1, dummy_video_frames, 112, 112, dtype=torch.float32).to(self.device)
+            
+            # Run forward pass
+            with torch.no_grad():
+                embedA = self.asd.model.forward_audio_frontend(dummy_audio)
+                embedV = self.asd.model.forward_visual_frontend(dummy_video)
+                out = self.asd.model.forward_audio_visual_backend(embedA, embedV)
+                _ = self.asd.lossAV.forward(out, labels=None)
+            
+            # Synchronize to ensure all operations complete
+            if self.device.type == 'cuda':
+                torch.cuda.synchronize(self.device)
+            
+            # Explicitly delete all temporary tensors to free references
+            # Note: We don't call empty_cache() to keep the memory allocator warm
+            del dummy_audio, dummy_video, embedA, embedV, out
+            
+            # Ensure model is in eval mode and gradients are disabled
+            self.asd.eval()
+            torch.set_grad_enabled(False)
+            
+            self.logger.info("Model warm-up completed successfully, all temporary state cleaned")
+            
+        except Exception as e:
+            self.logger.warning(f"Model warm-up failed (non-critical): {e}")
+            # Warm-up failure is non-critical; inference will still work but may be slower initially
 
     # ------------- Person lifecycle -------------
 
