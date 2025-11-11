@@ -1,8 +1,8 @@
 import torch
 import torch.nn as nn
 
-from model.Classifier import Fusion, Detector
-from model.Encoder import visual_encoder, audio_encoder
+from .Classifier import Fusion, Detector
+from .Encoder import visual_encoder, audio_encoder
 
 
 class ASD_Model(nn.Module):

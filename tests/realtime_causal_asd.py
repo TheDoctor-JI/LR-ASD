@@ -13,7 +13,7 @@ import python_speech_features
 import sys, os
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))  # for model import
 
-from ASD import ASD
+from ..ASD import ASD
 
 # ========= Global realtime config =========
 CUDA_DEVICE = os.environ.get("ASD_CUDA_DEVICE", "cuda:1")  # unified device handle
